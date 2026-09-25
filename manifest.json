@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.daniluvatar.agent-fleet",
+  "name": "Agent Fleet",
+  "version": "0.0.1",
+  "author": "Daniluvatar",
+  "license": "MIT",
+  "description": "One bar widget for your AI subscription allowance. Phase 1: Codex 5-hour and weekly limits, with the used percentage in the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Fleet",
+    "description": "Codex subscription allowance in the bar: tier, 5-hour and weekly percent used, and the reset countdown, without opening another terminal.",
+    "category": "Developer Tools",
+    "aliases": [
+      "agent fleet",
+      "fleet",
+      "codex",
+      "usage",
+      "limits",
+      "quota"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 900,
+      "showPercentInBar": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 60,
+        "defaultValue": 900,
+        "description": "Matches the first-party Agents widget default. The refresh that runs when you open the panel is separate and immediate."
+      },
+      {
+        "key": "showPercentInBar",
+        "type": "boolean",
+        "label": "Show percent used in the bar",
+        "defaultValue": true,
+        "description": "The bar shows the highest-used window. Turn off for an icon-only bar."
+      }
+    ]
+  }
+}

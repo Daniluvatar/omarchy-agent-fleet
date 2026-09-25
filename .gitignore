@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+*.debug.json
+.DS_Store
