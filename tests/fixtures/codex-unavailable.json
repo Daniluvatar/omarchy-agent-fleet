@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "codex",
+  "name": "Codex",
+  "updatedAt": "2026-09-25T18:05:25.561582+00:00",
+  "ready": true,
+  "hasLocalStats": true,
+  "todayPrompts": 0,
+  "todaySessions": 0,
+  "todayTotalTokens": 0,
+  "todayTokensByModel": {},
+  "recentDays": [],
+  "totalPrompts": 0,
+  "totalSessions": 0,
+  "activeDays": 0,
+  "activeDates": [],
+  "modelUsage": {},
+  "limits": [],
+  "tierLabel": "",
+  "usageStatusText": "Codex limits unavailable",
+  "authHelpText": "Run `codex login` to authenticate."
+}

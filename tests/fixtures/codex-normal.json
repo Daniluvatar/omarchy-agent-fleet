@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "codex",
+  "name": "Codex",
+  "updatedAt": "2026-09-25T18:05:25.561582+00:00",
+  "ready": true,
+  "hasLocalStats": true,
+  "todayPrompts": 0,
+  "todaySessions": 0,
+  "todayTotalTokens": 0,
+  "todayTokensByModel": {},
+  "recentDays": [],
+  "totalPrompts": 12,
+  "totalSessions": 3,
+  "activeDays": 2,
+  "activeDates": ["2026-09-24", "2026-09-25"],
+  "modelUsage": {},
+  "limits": [
+    { "label": "5h window", "percent": 0.03, "resetsAt": "2026-09-25T19:26:51+00:00" },
+    { "label": "Weekly (7-day)", "percent": 1.0, "resetsAt": "2026-09-26T18:40:25+00:00" }
+  ],
+  "tierLabel": "plus",
+  "usageStatusText": "",
+  "authHelpText": "Run `codex login` to authenticate."
+}

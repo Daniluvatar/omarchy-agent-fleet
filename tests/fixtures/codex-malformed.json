@@ -1,0 +1,4 @@
+{
+  "schemaVersion": 1,
+  "id": "codex",
+  "limits": [ { "label": "5h window", "percent": 0.0
