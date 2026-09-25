@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Agent Fleet Codex collector.
+
+Prints exactly one JSON document on stdout, following the Agent Fleet record
+contract (``schemaVersion`` 1). Diagnostics go to stderr, never to stdout.
+
+Every failure mode -- Codex absent, logged out, timed out, or answering with
+garbage -- still prints a valid record with ``available: false`` and exits 0,
+so the panel never has to parse a crash. Exit code 0 always means "a valid
+structured record was produced".
+
+Data is borrowed from the Omarchy-owned collector
+(``omarchy-agent-usage-codex --limits-only``), so authentication stays owned by
+Codex/Omarchy. This script never reads credentials, prompts or message
+content, and never copies upstream text into the record.
+
+Development hooks used by the tests, not by the panel:
+
+    --input PATH|-   read the upstream record from a file (or stdin)
+    --command CMD    override the upstream command
+"""
+
+import argparse
+import json
+import math
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+UPSTREAM_COMMAND = "omarchy-agent-usage-codex --limits-only"
+DEFAULT_TIMEOUT_SEC = 20.0
+
+CODE_UNAVAILABLE = "CODEX_UNAVAILABLE"
+CODE_MALFORMED = "UPSTREAM_MALFORMED"
+CODE_FAILED = "UPSTREAM_FAILED"
+CODE_INTERNAL = "INTERNAL_ERROR"
+
+# Fixed, human-readable strings only. Raw upstream text and exception detail
+# stay on stderr so the panel can render these verbatim.
+ERROR_MESSAGES = {
+    CODE_UNAVAILABLE: "Codex usage information is unavailable.",
+    CODE_MALFORMED: "Codex usage information could not be read.",
+    CODE_FAILED: "Codex usage collector could not be reached.",
+    CODE_INTERNAL: "Agent Fleet collector failed.",
+}
+
+# Upstream labels are display text, not stable keys ("5h window",
+# "Weekly (7-day)", "45m window"), so windows are identified semantically.
+WEEKLY_LABEL = re.compile(r"week|7\s*-?\s*d", re.IGNORECASE)
+SESSION_LABEL = re.compile(r"\d+\s*(?:h|hour|m|min)\b|session", re.IGNORECASE)
+
+DEFAULT_WINDOW_LABELS = {"session": "5h window", "weekly": "Weekly (7-day)"}
+WINDOW_SLOTS = ("session", "weekly")
+
+
+def note(message):
+    """Diagnostics only. stdout must carry exactly one JSON document."""
+    print(f"agent-fleet-codex: {message}", file=sys.stderr)
+
+
+def make_record(available, tier, limits, error_code):
+    return {
+        "schemaVersion": 1,
+        "provider": "codex",
+        "available": available,
+        "tier": tier,
+        "limits": {slot: limits.get(slot) for slot in WINDOW_SLOTS},
+        "error": None if error_code is None else {
+            "code": error_code,
+            "message": ERROR_MESSAGES.get(error_code, "Codex usage information is unavailable."),
+        },
+    }
+
+
+def empty_limits():
+    return {slot: None for slot in WINDOW_SLOTS}
+
+
+def to_percent(fraction):
+    """Convert the upstream fraction of 1 to a human percentage.
+
+    0.03 -> 3.0, 1.0 -> 100.0. Zero is a real value, not a missing one.
+    """
+    try:
+        value = float(fraction)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return round(value * 100.0, 1)
+
+
+def timestamp_or_none(value):
+    """Validate an ISO-8601 reset timestamp and preserve it verbatim.
+
+    The panel owns formatting; the collector only drops unusable values.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = f"{raw[:-1]}+00:00" if raw.endswith("Z") else raw
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        note(f"ignoring unparseable resetsAt value ({len(raw)} chars)")
+        return None
+    return raw
+
+
+def normalize_tier(value):
+    tier = " ".join(str(value or "").split()).lower()
+    return tier or None
+
+
+def classify(label):
+    text = str(label or "")
+    if WEEKLY_LABEL.search(text):
+        return "weekly"
+    if SESSION_LABEL.search(text):
+        return "session"
+    return None
+
+
+def guess_slot(index, total):
+    """Last resort when a label carries no recognizable window semantics.
+
+    Upstream emits the primary window before the secondary one, so position
+    maps to session-then-weekly.
+    """
+    if total == 1:
+        return "session"
+    if total == 2:
+        return WINDOW_SLOTS[index] if index < len(WINDOW_SLOTS) else None
+    return None
+
+
+def map_limits(entries):
+    limits = empty_limits()
+    total = len(entries)
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            note(f"ignoring non-object limit entry at position {index}")
+            continue
+        percent = to_percent(entry.get("percent"))
+        if percent is None:
+            note(f"ignoring limit entry at position {index} without a usable percent")
+            continue
+
+        slot = classify(entry.get("label"))
+        if slot is not None and limits[slot] is not None:
+            note(f"ignoring duplicate {slot} limit entry at position {index}")
+            continue
+        if slot is None:
+            slot = guess_slot(index, total)
+            if slot is None or limits[slot] is not None:
+                note(f"cannot classify limit entry at position {index}; no window slot left")
+                continue
+            note(f"label carries no window semantics; using upstream order for slot {slot}")
+
+        label = " ".join(str(entry.get("label") or "").split())
+        limits[slot] = {
+            "label": label or DEFAULT_WINDOW_LABELS[slot],
+            "usedPercent": percent,
+            "resetsAt": timestamp_or_none(entry.get("resetsAt")),
+        }
+    return limits
+
+
+def read_upstream(args):
+    """Return (text, error_code); exactly one element is None."""
+    if args.input is not None:
+        if args.input == "-":
+            return sys.stdin.read(), None
+        try:
+            return Path(args.input).read_text(encoding="utf-8"), None
+        except OSError as exc:
+            note(f"cannot read --input: {exc.strerror or exc}")
+            return None, CODE_FAILED
+
+    command = shlex.split(args.command or UPSTREAM_COMMAND)
+    if not command:
+        note("upstream command is empty")
+        return None, CODE_FAILED
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
+    except FileNotFoundError:
+        note(f"upstream command not found: {command[0]}")
+        return None, CODE_FAILED
+    except subprocess.TimeoutExpired:
+        note(f"upstream command timed out after {args.timeout:g}s")
+        return None, CODE_FAILED
+    except OSError as exc:
+        note(f"cannot run upstream command: {exc.strerror or exc}")
+        return None, CODE_FAILED
+
+    if proc.returncode != 0:
+        # Upstream stderr is deliberately not forwarded.
+        note(f"upstream command exited {proc.returncode}")
+        return None, CODE_FAILED
+    return proc.stdout, None
+
+
+def collect(args):
+    text, error_code = read_upstream(args)
+    if error_code is not None:
+        return make_record(False, None, empty_limits(), error_code)
+
+    try:
+        raw = json.loads(text)
+    except (TypeError, ValueError):
+        return make_record(False, None, empty_limits(), CODE_MALFORMED)
+    if not isinstance(raw, dict):
+        note("upstream record is not a JSON object")
+        return make_record(False, None, empty_limits(), CODE_MALFORMED)
+
+    entries = raw.get("limits")
+    if not isinstance(entries, list):
+        if entries is not None:
+            note("upstream limits field is not a list")
+        entries = []
+
+    tier = normalize_tier(raw.get("tierLabel"))
+    limits = map_limits(entries)
+    available = bool(tier) or any(limits[slot] for slot in WINDOW_SLOTS)
+    if not available:
+        note("upstream record carries no tier and no usable limits")
+    return make_record(available, tier if available else None, limits, None if available else CODE_UNAVAILABLE)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Emit the Agent Fleet Codex usage record.")
+    parser.add_argument("--input", help="read the upstream record from this file, or - for stdin")
+    parser.add_argument("--command", help=f"upstream command override (default: {UPSTREAM_COMMAND})")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SEC, help="upstream timeout in seconds")
+    args = parser.parse_args(argv)
+
+    try:
+        record = collect(args)
+    except Exception as exc:  # a crash must still leave a parseable record
+        note(f"unexpected failure: {type(exc).__name__}")
+        record = make_record(False, None, empty_limits(), CODE_INTERNAL)
+
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
