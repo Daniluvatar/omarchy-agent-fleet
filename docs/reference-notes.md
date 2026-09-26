@@ -169,7 +169,15 @@ Constraints found:
   iteration loop is therefore: commit, then clone/copy into
   `~/.config/omarchy/plugins/io.github.daniluvatar.agent-fleet/`, then
   `omarchy plugin enable io.github.daniluvatar.agent-fleet`.
-- A symlinked plugin folder is rejected outright, so `ln -s` is not a dev loop.
+- The **validator** refuses a symlinked plugin path (`omarchy plugin
+  validate` exits 1 on one; it also refuses symlinks *inside* the folder), but
+  the shell's plugin **loader follows symlinks fine** — the live setup for this
+  repo is a symlink from
+  `~/.config/omarchy/plugins/io.github.daniluvatar.agent-fleet` to the
+  repository root, enabled once, and it loads and refreshes normally after
+  `omarchy restart shell`. That is exactly the dev loop used for Tasks 2–4.
+  (If a published install has to pass the validator, use a real copied
+  directory instead.)
 - Bar placement is data, in `~/.config/omarchy/shell.json` under
   `bar.layout.left/center/right`, as `{ "id": "<plugin-id>", ...settings }`.
   Defaults: `/usr/share/omarchy/config/omarchy/shell.json`. Five third-party
@@ -222,8 +230,8 @@ Notes that change how the adapter must be written:
 3. **`resetsAt` is ISO-8601 with offset, or `""`.** Whole seconds from Codex,
    sub-second from others; parse tolerantly.
 4. **Empty `limits[]` means unknown, never "no quota".** The reason arrives in
-   `usageStatusText` and the remedy in `authHelpText`. This is the graceful
-   failure path of Task 4: render those two strings, not an exception.
+   `usageStatusText` and the remedy in `authHelpText`. See §11 for what the final failure path ended up being — the
+   UI shows one human-readable unavailable state and never those raw strings.
    Verified locally — the sibling `claude.json` record currently reads
    `ready: false`, `usageStatusText: "Waiting for auth"`,
    `authHelpText: "Run \`claude auth login\` to restore authoritative usage."`,
@@ -268,6 +276,43 @@ Reported, not acted on. All of these are out of Phase 1 scope.
   `opencode@1.18.27` (60.5 MB, 26.5 s); warm `opencode auth list` is 0.57 s and
   reports `0 credentials`. Any future provider probe must never be the thing
   that triggers a toolchain install from the bar.
+
+## 11. Corrections and findings from Tasks 2-4
+
+Recorded when the assumption could not be made, or turned out differently.
+
+1. **`IpcHandler` is a `Quickshell.Io` type, not a core `Quickshell` type.**
+   Both structural references (`agents/Panel.qml`, `calmasacow.grok-usage`)
+   do `import Quickshell` *and* `import Quickshell.Io`. Dropping the second
+   import yields a QML `Component is not available` error at panel load; our
+   Task 4 draft tripped on exactly this.
+2. **`Qt.resolvedUrl()` returns a URL object, not a string.** Call it `.toString()`
+   before string operations (e.g. the `file://` prefix strip in
+   `CodexUsage.qml`).
+3. **The `IpcHandler` "another handler registered for target" warning in
+   `journalctl -t omarchy-shell` is benign.** Every first-party widget that
+   registers its own handler (agents included) logs the same line; the shell's
+   `PluginBarApi` registers first and each plugin's handler overrides it.
+   Not a bug.
+4. **The UI does not surface the raw upstream strings** (Task 4, approved).
+   The final failure path is one human-readable unavailable state in the
+   panel (Usage unavailable / authenticate with Codex and try again);
+   `usageStatusText`, `authHelpText`, exceptions, and stack traces are never
+   rendered. The collector still emits a structured `error` record (code +
+   safe message), but the UI does not display it.
+5. **The `showPercentInBar` manifest setting is declared for the settings UI
+   but the bar always shows the fullest window** — the setting does not yet
+   change bar behavior (documented as a known limitation in the README).
+6. **Null windows are a real state, not just missing.** Windows that are
+   present in the record but whose `usedPercent` is null, or records with no
+   windows at all, must render gracefully (an em-dash placeholder, `no
+   window data`). Observed live: the Codex backend rotated windows
+   mid-verification and the panel handled it without a crash.
+7. **Both bar and panel read one shared `CodexUsage` record** so the two
+   faces cannot disagree; the bar shows the fullest reported window
+   (`Codex 100%`), tinted `urgent` when the session window is at or over 80%
+   used; `WidgetButton` + `KeyboardPanel` + `PanelHero`/`PanelSectionHeader`
+   from `qs.Ui` provide the surface. No custom visual system needed.
 
 ## 10. Reproducing these notes
 
