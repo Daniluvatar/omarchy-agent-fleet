@@ -1,0 +1,7 @@
+description: A capable agent profile.
+ui_meta:
+  hermes-bots:
+    shape: spark
+    color: '#5c7cfa'
+    title: "Engineer"
+    custom: true
