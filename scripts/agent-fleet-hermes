@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Agent Fleet Hermes activity collector (Phase 2).
+
+Reads the per-profile ``state.db`` SQLite databases under the Hermes
+profiles directory (default: ``~/.hermes/profiles``) in strictly read-only
+mode and prints exactly one JSON document on stdout. Diagnostics go to
+stderr, never to stdout.
+
+The normalized records are **usage records**, one per source row in the
+``session_model_usage`` table. They are aggregates (Hermes records calls,
+tokens and cache per session + model + task bucket), NOT one event per API
+call -- the collector must not fabricate per-call events. Per-call timing
+is intentionally absent today; Phase 3 may source it from ``agent.log``
+or another Hermes surface (see
+``docs/hermes-reference-notes.md``).
+
+Only successful ``openai-codex`` usage is surfaced: failed calls never
+appear in ``session_model_usage`` (they lack the usage response), so a
+record is always a count of successful calls. All task buckets (main
+turns, approval, background_review, title_generation, ...) are real Codex
+usage and are all included. ``task`` is kept verbatim for internal use and
+the UI must not design around it yet.
+
+When the timestamp of a session is missing or unusable it is omitted
+(null) rather than invented. Numeric fields missing from the source are
+normalized to zero, matching the source table's NOT NULL DEFAULT 0
+semantics; zero is a value, not a missing one.
+
+The collector never reads ``messages.content``, ``auth.json`` or any other
+content-bearing file, and never copies upstream text into the record.
+
+Development hook used by the tests, not by the panel:
+
+    --root PATH   scan this directory instead of ~/.hermes/profiles
+"""
+
+import argparse
+import json
+import math
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+PROVIDER = "hermes"
+DEFAULT_ROOT = Path.home() / ".hermes" / "profiles"
+
+# Only the openai-codex provider rows are Phase 2 usage.
+OPENAI_CODEX_PROVIDER = "openai-codex"
+
+# A record is one aggregate usage row: the session-level timestamps come
+# from sessions (with the parent session and the last message as fallbacks,
+# as recorded in docs/hermes-reference-notes.md), everything else from the
+# usage row itself.
+USAGE_QUERY = """
+SELECT u.billing_provider,
+       u.model,
+       u.session_id,
+       u.task,
+       u.api_call_count,
+       u.input_tokens,
+       u.output_tokens,
+       u.cache_read_tokens,
+       u.cache_write_tokens,
+       COALESCE(s.last_activity_at, s.started_at) AS session_time,
+       COALESCE(p.last_activity_at, p.started_at) AS parent_time,
+       m.last_message_time AS message_time
+FROM session_model_usage u
+LEFT JOIN sessions s ON s.id = u.session_id
+LEFT JOIN sessions p ON p.id = s.parent_session_id
+LEFT JOIN (
+    SELECT session_id, MAX(timestamp) AS last_message_time
+    FROM messages
+    GROUP BY session_id
+) m ON m.session_id = u.session_id
+WHERE u.billing_provider = ?
+ORDER BY u.session_id, u.model, u.task
+"""
+
+CODE_PROFILE_UNREADABLE = "HERMES_PROFILE_UNREADABLE"
+
+# Fixed, human-readable strings only. Path detail and exception detail stay
+# on stderr so the panel can render these verbatim.
+ERROR_MESSAGES = {
+    CODE_PROFILE_UNREADABLE: "Hermes profile activity could not be read.",
+}
+
+
+def note(message):
+    """Diagnostics only. stdout must carry exactly one JSON document."""
+    print(f"agent-fleet-hermes: {message}", file=sys.stderr)
+
+
+def non_negative_int(value):
+    """Normalize a source counter: missing/zero is 0, junk becomes 0."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float):
+        return max(int(value), 0) if math.isfinite(value) else 0
+    return 0
+
+
+def iso_timestamp(value):
+    """Render a source epoch-seconds value as ISO-8601 with offsets.
+
+    The machine's local timezone is used so activity lines up with other
+    fleet panels; a missing, zero or unusable value returns None -- it is
+    never fabricated.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds).astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def normalized_text(value):
+    """Collapse whitespace-only junk to None; keep real labels verbatim."""
+    text = " ".join(str(value or "").split())
+    return text or None
+
+
+def read_profile_display_name(profile_dir):
+    """The optional profile.yaml title; absence or junk falls back to None.
+
+    The directory name is the stable identity; the title is decoration.
+    YAML is parsed conservatively with no external dependency.
+    """
+    path = profile_dir / "profile.yaml"
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    current_hermes_bots = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("ui_meta:"):
+            current_hermes_bots = False
+            continue
+        if current_hermes_bots:
+            body = line.split("#", 1)[0].strip()
+            if body.startswith("title:"):
+                title = body[len("title:"):].strip()
+                if len(title) >= 2 and title[0] == title[-1] and title[0] in "'\"":
+                    title = title[1:-1]
+                return title.strip() or None
+        if line.startswith("hermes-bots:"):
+            current_hermes_bots = True
+    return None
+
+
+def load_profile(profile_dir):
+    """Read one profile's DB read-only and return its normalized records.
+
+    Returns None (with a stderr note) when the DB cannot be used at all --
+    a bad database must never take down the other profiles.
+    """
+    db_path = profile_dir / "state.db"
+    if not db_path.is_file():
+        note(f"{profile_dir.name}: no state.db, profile skipped")
+        return None
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+        try:
+            rows = conn.execute(USAGE_QUERY, (OPENAI_CODEX_PROVIDER,)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        note(f"{profile_dir.name}: database unreadable ({type(exc).__name__})")
+        return None
+
+    agent = profile_dir.name
+    records = []
+    for (provider, model, session_id, task, calls, in_tok, out_tok,
+         cache_read, cache_write, session_time, parent_time, message_time) in rows:
+        model = normalized_text(model)
+        session_id = normalized_text(session_id)
+        if model is None or session_id is None:
+            note(f"{agent}: usage row without a usable model or session, skipped")
+            continue
+        records.append({
+            "timestamp": (
+                iso_timestamp(session_time)
+                or iso_timestamp(parent_time)
+                or iso_timestamp(message_time)
+            ),
+            "harness": PROVIDER,
+            "agent": agent,
+            "provider": OPENAI_CODEX_PROVIDER,
+            "model": model,
+            "sessionId": session_id,
+            # Internal field for now; the UI must not design around it yet.
+            "task": normalized_text(task) or "",
+            "calls": non_negative_int(calls),
+            "inputTokens": non_negative_int(in_tok),
+            "outputTokens": non_negative_int(out_tok),
+            "cacheReadTokens": non_negative_int(cache_read),
+            "cacheWriteTokens": non_negative_int(cache_write),
+        })
+    return records
+
+
+def collect(args):
+    root = Path(args.root).expanduser()
+    profiles = []
+
+    if not root.is_dir():
+        note(f"profiles root not found: {root}")
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "provider": PROVIDER,
+            "available": False,
+            "profiles": [],
+            "error": None,
+        }
+
+    for profile_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not profile_dir.is_dir():
+            continue
+        name = profile_dir.name
+        if name in (".", "..") or name.startswith("."):
+            continue
+        records = load_profile(profile_dir)
+        if records is None:
+            profiles.append({
+                "agent": name,
+                "displayName": read_profile_display_name(profile_dir),
+                "records": [],
+                "error": {
+                    "code": CODE_PROFILE_UNREADABLE,
+                    "message": ERROR_MESSAGES[CODE_PROFILE_UNREADABLE],
+                },
+            })
+            continue
+        profiles.append({
+            "agent": name,
+            "displayName": read_profile_display_name(profile_dir),
+            "records": records,
+            "error": None,
+        })
+
+    # Data from at least one profile wins; per-profile errors are carried in
+    # that profile's own error object, never hidden behind the top level.
+    available = any(p["records"] for p in profiles)
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "provider": PROVIDER,
+        "available": available,
+        "profiles": profiles,
+        "error": None,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Emit the Agent Fleet Hermes activity record.")
+    parser.add_argument("--root", default=str(DEFAULT_ROOT),
+                        help="Hermes profiles directory (default: ~/.hermes/profiles)")
+    args = parser.parse_args(argv)
+
+    try:
+        record = collect(args)
+    except Exception as exc:  # a crash must still leave a parseable record
+        note(f"unexpected failure: {type(exc).__name__}")
+        record = {
+            "schemaVersion": SCHEMA_VERSION,
+            "provider": PROVIDER,
+            "available": False,
+            "profiles": [],
+            "error": None,
+        }
+
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
