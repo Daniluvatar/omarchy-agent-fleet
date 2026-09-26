@@ -16,8 +16,8 @@ License: [MIT](LICENSE) · Author: Daniluvatar
 The first-party Agents widget already knows your Codex limits, but its bar slot
 is a single static glyph (`󱚣`) — every number lives inside the popup, and the
 only at-a-glance signal is a colour change that stays silent below 90 % used.
-Agent Fleet exists to answer "how much allowance do I have left" without
-clicking anything.
+Agent Fleet exists to answer "how much of my allowance have I used?" at a
+ glance, without clicking anything.
 
 ## What it is
 
@@ -203,8 +203,6 @@ system file; the only user-config change is the deliberate
 
 - **Codex only.** No other provider, no per-agent attribution — that is the
   roadmap below, intentionally unimplemented.
-- The `showPercentInBar` manifest setting is declared for the settings UI but
-  does not change the bar yet (the bar always shows the fullest window).
 - The panel labels are fixed (`5-HOUR WINDOW`, `WEEKLY`); window labels
   `session`/`weekly` are mapped from upstream label text, not from a stable
   key — a future upstream relabel could change the mapping.
