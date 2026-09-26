@@ -300,9 +300,12 @@ Recorded when the assumption could not be made, or turned out differently.
    `usageStatusText`, `authHelpText`, exceptions, and stack traces are never
    rendered. The collector still emits a structured `error` record (code +
    safe message), but the UI does not display it.
-5. **The `showPercentInBar` manifest setting is declared for the settings UI
-   but the bar always shows the fullest window** — the setting does not yet
-   change bar behavior (documented as a known limitation in the README).
+5. **The `showPercentInBar` manifest setting is implemented** (follow-up to
+   Phase 1): `Panel.qml` reads `setting("showPercentInBar", true)`; off,
+   the bar shows the `Agent Fleet` label instead of the number. The urgent
+   tint (session window at or over 80 %) is the at-a-glance signal and works
+   in both modes. (The original draft declared the setting but never read it;
+   that was fixed rather than removed from the manifest.)
 6. **Null windows are a real state, not just missing.** Windows that are
    present in the record but whose `usedPercent` is null, or records with no
    windows at all, must render gracefully (an em-dash placeholder, `no

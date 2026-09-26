@@ -60,6 +60,10 @@ Panel {
 
   // ------------------------------------------------------------- settings
   readonly property int refreshInterval: Number(setting("refreshIntervalSec", 900))
+  // Declared in manifest.json (barWidget.schema): when off, the bar shows
+  // the fleet label without a number. The bar's urgent tint (session window
+  // at or over 80 %) is the at-a-glance signal and works either way.
+  readonly property bool showPercentInBar: setting("showPercentInBar", true) === true
 
   // ------------------------------------------------------------- data
   readonly property var codexUsage: CodexUsage {}
@@ -117,8 +121,11 @@ Panel {
       codexUsage.refresh()
   }
 
-  // Bar slot: Codex percent when one is reported, otherwise the fleet name.
+  // Bar slot: Codex percent when one is reported and the setting allows it,
+  // otherwise the fleet name.
   readonly property string barLabel: {
+    if (!root.showPercentInBar)
+      return "Agent Fleet"
     var p = root.barPercent
     if (p !== null)
       return "Codex " + formatPercent(p)
