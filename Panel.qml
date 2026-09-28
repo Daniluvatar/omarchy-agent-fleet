@@ -15,6 +15,10 @@ import qs.Ui
 // Only one user-facing usage-unavailable state exists: the window rows
 // render whatever the record says, and when the record is missing, stale, or
 // unavailable they render "—".
+//
+// The panel also carries a Hermes Activity section fed by HermesUsage
+// (scripts/agent-fleet-hermes). Hermes rows are activity counts only; they
+// never feed the bar percentage, the window bars, or any attribution.
 Panel {
   id: root
   moduleName: "io.github.daniluvatar.agent-fleet"
@@ -77,6 +81,13 @@ Panel {
   readonly property var windows: codexUsage.slots
   readonly property var barPercent: codexUsage.barPercent // number | null
 
+  // Hermes activity (separate collector, separate record). Display rows and
+  // formatting live in HermesUsage; nothing here feeds the bar or the
+  // allowance windows.
+  readonly property var hermesUsage: HermesUsage {}
+  readonly property bool hermesReady: hermesUsage.dataState === "ready"
+  readonly property bool hermesLoading: hermesUsage.dataState === "loading"
+
   function formatPercent(p) {
     if (p === null || p === undefined)
       return ""
@@ -116,9 +127,39 @@ Panel {
     return formatClock(t)
   }
 
+  // Hermes section copy. The meta line states the window and what it counts;
+  // the disclaimer keeps activity clearly separate from allowance usage.
+  readonly property string hermesMetaLine: {
+    if (!root.hermesReady)
+      return ""
+    var agents = root.hermesUsage.activeAgents
+    var parts = ["Last " + root.hermesUsage.lookbackDays + " days",
+                 agents + (agents === 1 ? " active agent" : " active agents"),
+                 root.formatCount(root.hermesUsage.totalCalls) + " calls"]
+    if (root.hermesUsage.unreadableAgents > 0)
+      parts.push(root.hermesUsage.unreadableAgents + " unreadable")
+    return parts.join(" · ")
+  }
+
+  readonly property string hermesStatusLine: {
+    if (root.hermesLoading)
+      return "Checking Hermes activity…"
+    if (!root.hermesReady)
+      return "Hermes activity unavailable"
+    if (root.hermesUsage.agents.length === 0)
+      return "No Codex activity in the last " + root.hermesUsage.lookbackDays + " days"
+    return ""
+  }
+
+  function formatCount(n) {
+    return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+  }
+
   function refresh() {
     if (codexUsage && codexUsage.refresh)
       codexUsage.refresh()
+    if (hermesUsage && hermesUsage.refresh)
+      hermesUsage.refresh()
   }
 
   // Bar slot: Codex percent when one is reported and the setting allows it,
@@ -320,6 +361,131 @@ Panel {
                   font.pixelSize: Style.font.caption
                 }
               }
+            }
+          }
+
+          PanelSeparator { width: parent.width }
+
+          // Hermes Activity: agent/model call counts observed locally in the
+          // lookback window. Activity counts only — no allowance share is
+          // shown or implied here; rows and states come from HermesUsage.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "Hermes Activity"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: text !== ""
+              width: parent.width
+              text: root.hermesMetaLine
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: text !== ""
+              width: parent.width
+              text: root.hermesStatusLine
+              // Urgent only for the unavailable state; loading and the quiet
+              // "no activity" case read as notes, as the Codex row above does.
+              color: root.hermesReady || root.hermesLoading ? root.dim : root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Repeater {
+              model: root.hermesUsage.agents
+              delegate: Column {
+                width: parent.width
+                spacing: Style.space(1)
+
+                Item {
+                  width: parent.width
+                  height: Math.max(agentName.implicitHeight, agentCalls.implicitHeight)
+                  Text {
+                    id: agentName
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: modelData.displayName
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+                  // Redundant with a lone model row, so only shown when an
+                  // agent splits across several models.
+                  Text {
+                    id: agentCalls
+                    visible: modelData.models.length > 1
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.formatCount(modelData.totalCalls) + (modelData.totalCalls === 1 ? " call" : " calls")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Repeater {
+                  model: modelData.models
+                  delegate: Column {
+                    width: parent.width
+                    spacing: 0
+
+                    Item {
+                      width: parent.width
+                      height: Math.max(modelName.implicitHeight, modelCalls.implicitHeight)
+                      Text {
+                        id: modelName
+                        anchors.left: parent.left
+                        anchors.leftMargin: Style.space(8)
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: modelData.label
+                        color: root.foreground
+                        opacity: 0.85
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        id: modelCalls
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.formatCount(modelData.calls) + (modelData.calls === 1 ? " call" : " calls")
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    Text {
+                      visible: text !== ""
+                      width: parent.width
+                      leftPadding: Style.space(8)
+                      text: modelData.tokenText
+                      color: root.faint
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              visible: root.hermesReady
+              width: parent.width
+              text: "Activity counts only — not a share of your Codex allowance."
+              color: root.faint
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
 
