@@ -6,32 +6,52 @@ profiles directory (default: ``~/.hermes/profiles``) in strictly read-only
 mode and prints exactly one JSON document on stdout. Diagnostics go to
 stderr, never to stdout.
 
-The normalized records are **usage records**, one per source row in the
-``session_model_usage`` table. They are aggregates (Hermes records calls,
-tokens and cache per session + model + task bucket), NOT one event per API
-call -- the collector must not fabricate per-call events. Per-call timing
-is intentionally absent today; Phase 3 may source it from ``agent.log``
-or another Hermes surface (see
-``docs/hermes-reference-notes.md``).
+The Phase 2 output is the **summary contract** (see
+``docs/omarchy-agent-fleet-phase-2.md``, Task 3): one ``agents`` entry per
+discovered profile, each carrying its ``models`` (aggregated per
+provider + model), per-agent totals, and a top-level ``summary``. Records
+thousands of rows deep are never sent to the panel.
 
-Only successful ``openai-codex`` usage is surfaced: failed calls never
-appear in ``session_model_usage`` (they lack the usage response), so a
-record is always a count of successful calls. All task buckets (main
-turns, approval, background_review, title_generation, ...) are real Codex
-usage and are all included. ``task`` is kept verbatim for internal use and
-the UI must not design around it yet.
+Aggregation semantics:
 
-When the timestamp of a session is missing or unusable it is omitted
-(null) rather than invented. Numeric fields missing from the source are
-normalized to zero, matching the source table's NOT NULL DEFAULT 0
-semantics; zero is a value, not a missing one.
+- The 7-day default lookback bounds the scan. A known timestamp strictly
+  older than ``now - lookback`` is dropped; a record whose timestamp is
+  null is *unknown* and is kept in the totals rather than invented or
+  discarded, but it must not move ``lastActivityAt``.
+- ``lastActivityAt`` at every level is the maximum **known** timestamp
+  among the included records; groups with only nulls render as ``null``.
+- ``calls`` / token counters are summed; a profile whose activity is all
+  outside the window (or that has none) renders as a zeroed agent entry.
 
-The collector never reads ``messages.content``, ``auth.json`` or any other
-content-bearing file, and never copies upstream text into the record.
+Normalization rules carry over from Task 2:
 
-Development hook used by the tests, not by the panel:
+- The sources are **usage aggregates**, one record per
+  ``session_model_usage`` row (session + model + task bucket). They are
+  NOT one event per API call -- per-call events are never fabricated;
+  per-call timing is intentionally absent today (Phase 3 may source it
+  from ``agent.log``).
+- Only successful ``openai-codex`` usage is surfaced: failed calls never
+  appear in ``session_model_usage`` (they lack the usage response). All
+  task buckets (main turns, approval, background_review,
+  title_generation, ...) are real Codex usage and are all included.
+  ``task`` is kept on the internal record for use by later phases; it is
+  not part of the summary contract.
+- Missing/NULL numeric fields normalize to zero, matching the source
+  table's NOT NULL DEFAULT 0 semantics; zero is a value, not a missing
+  one.
+- A corrupt or unreadable profile is reported on its own ``error`` field
+  and never takes the other profiles down.
 
-    --root PATH   scan this directory instead of ~/.hermes/profiles
+No persistent storage is written. Nothing here stores a share of any
+allowance -- the contract reports activity only. The collector never
+reads ``messages.content``, ``auth.json`` or any other content-bearing
+file, and never copies upstream text into the record.
+
+Development hooks used by the tests, not by the panel:
+
+    --root PATH          scan this directory instead of ~/.hermes/profiles
+    --lookback-days N    override the 7-day default lookback
+    --now EPOCH          fix "now" to an epoch-seconds value (determinism)
 """
 
 import argparse
@@ -39,20 +59,34 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROVIDER = "hermes"
+HARNESS = "hermes"
 DEFAULT_ROOT = Path.home() / ".hermes" / "profiles"
 
-# Only the openai-codex provider rows are Phase 2 usage.
+# Only the openai-codex provider rows are Phase 2 activity.
 OPENAI_CODEX_PROVIDER = "openai-codex"
 
-# A record is one aggregate usage row: the session-level timestamps come
-# from sessions (with the parent session and the last message as fallbacks,
-# as recorded in docs/hermes-reference-notes.md), everything else from the
-# usage row itself.
+# Phase 2 default: the lookback aligns with the Codex weekly window and
+# keeps the scan explicitly bounded.
+DEFAULT_LOOKBACK_DAYS = 7.0
+SECONDS_PER_DAY = 86400.0
+
+# Fixed, human-readable strings only. Path detail and exception detail stay
+# on stderr so the panel can render these verbatim.
+CODE_HERMES_UNAVAILABLE = "HERMES_UNAVAILABLE"
+CODE_PROFILE_UNREADABLE = "HERMES_PROFILE_UNREADABLE"
+ERROR_MESSAGES = {
+    CODE_HERMES_UNAVAILABLE: "Hermes activity information is unavailable.",
+    CODE_PROFILE_UNREADABLE: "Hermes profile activity could not be read.",
+}
+
+# A record is one aggregate usage row: the timestamps come from sessions
+# (with the parent session and the last message as fallbacks, as recorded
+# in docs/hermes-reference-notes.md), everything else from the usage row.
 USAGE_QUERY = """
 SELECT u.billing_provider,
        u.model,
@@ -78,14 +112,6 @@ WHERE u.billing_provider = ?
 ORDER BY u.session_id, u.model, u.task
 """
 
-CODE_PROFILE_UNREADABLE = "HERMES_PROFILE_UNREADABLE"
-
-# Fixed, human-readable strings only. Path detail and exception detail stay
-# on stderr so the panel can render these verbatim.
-ERROR_MESSAGES = {
-    CODE_PROFILE_UNREADABLE: "Hermes profile activity could not be read.",
-}
-
 
 def note(message):
     """Diagnostics only. stdout must carry exactly one JSON document."""
@@ -93,7 +119,7 @@ def note(message):
 
 
 def non_negative_int(value):
-    """Normalize a source counter: missing/zero is 0, junk becomes 0."""
+    """Normalize a source counter: missing is 0, junk becomes 0."""
     if value is None:
         return 0
     if isinstance(value, bool):
@@ -105,13 +131,8 @@ def non_negative_int(value):
     return 0
 
 
-def iso_timestamp(value):
-    """Render a source epoch-seconds value as ISO-8601 with offsets.
-
-    The machine's local timezone is used so activity lines up with other
-    fleet panels; a missing, zero or unusable value returns None -- it is
-    never fabricated.
-    """
+def epoch_seconds(value):
+    """A usable epoch-seconds value, or None. Never invented."""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -119,6 +140,18 @@ def iso_timestamp(value):
     except (TypeError, ValueError):
         return None
     if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return seconds
+
+
+def iso_timestamp(value):
+    """Render a source epoch-seconds value as ISO-8601 with the local offset.
+
+    A missing, zero or unusable value returns None -- it is never
+    fabricated.
+    """
+    seconds = epoch_seconds(value)
+    if seconds is None:
         return None
     try:
         return datetime.fromtimestamp(seconds).astimezone().isoformat(timespec="seconds")
@@ -166,6 +199,10 @@ def read_profile_display_name(profile_dir):
 def load_profile(profile_dir):
     """Read one profile's DB read-only and return its normalized records.
 
+    Records are the internal normalized events: ``timestamp`` is an
+    internal epoch value (None when unknown), ``task`` is kept verbatim
+    for later phases, and every token counter is a non-negative int.
+
     Returns None (with a stderr note) when the DB cannot be used at all --
     a bad database must never take down the other profiles.
     """
@@ -195,16 +232,17 @@ def load_profile(profile_dir):
             continue
         records.append({
             "timestamp": (
-                iso_timestamp(session_time)
-                or iso_timestamp(parent_time)
-                or iso_timestamp(message_time)
+                epoch_seconds(session_time)
+                or epoch_seconds(parent_time)
+                or epoch_seconds(message_time)
             ),
-            "harness": PROVIDER,
+            "harness": HARNESS,
             "agent": agent,
             "provider": OPENAI_CODEX_PROVIDER,
             "model": model,
             "sessionId": session_id,
-            # Internal field for now; the UI must not design around it yet.
+            # Internal field kept for Phase 3; not part of the summary
+            # contract.
             "task": normalized_text(task) or "",
             "calls": non_negative_int(calls),
             "inputTokens": non_negative_int(in_tok),
@@ -215,20 +253,93 @@ def load_profile(profile_dir):
     return records
 
 
-def collect(args):
-    root = Path(args.root).expanduser()
-    profiles = []
+def _model_entry(provider, model):
+    return {
+        "provider": provider,
+        "model": model,
+        "calls": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "lastActivityAt": None,
+        "_lastEpoch": None,
+    }
 
+
+def summarize_agent(agent_id, display_name, records, cutoff_epoch):
+    """Fold one profile's records into the agent summary entry.
+
+    The lookback keeps records with a known timestamp at or after the
+    cutoff; records with a null timestamp are unknown, so they stay in the
+    totals but never move ``lastActivityAt``.
+    """
+    included = [
+        record for record in records
+        if record["timestamp"] is None or record["timestamp"] >= cutoff_epoch
+    ]
+
+    models = {}
+    for record in included:
+        entry = models.setdefault(
+            (record["provider"], record["model"]),
+            _model_entry(record["provider"], record["model"]),
+        )
+        entry["calls"] += record["calls"]
+        entry["inputTokens"] += record["inputTokens"]
+        entry["outputTokens"] += record["outputTokens"]
+        entry["cacheReadTokens"] += record["cacheReadTokens"]
+        entry["cacheWriteTokens"] += record["cacheWriteTokens"]
+        if (record["timestamp"] is not None
+                and (entry["_lastEpoch"] is None
+                     or record["timestamp"] > entry["_lastEpoch"])):
+            entry["_lastEpoch"] = record["timestamp"]
+
+    rendered = []
+    agent_last = None
+    for entry in models.values():
+        last = entry.pop("_lastEpoch")
+        entry["lastActivityAt"] = iso_timestamp(last)
+        if last is not None and (agent_last is None or last > agent_last):
+            agent_last = last
+        rendered.append(entry)
+
+    # Busiest model first, name as the deterministic tie-break.
+    rendered.sort(key=lambda entry: (-entry["calls"], entry["model"]))
+
+    return {
+        "id": agent_id,
+        "displayName": display_name or agent_id,
+        "models": rendered,
+        "totalCalls": sum(entry["calls"] for entry in rendered),
+        "lastActivityAt": iso_timestamp(agent_last),
+        "error": None,
+    }
+
+
+def unavailable_record(profiles_discovered=0):
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "harness": HARNESS,
+        "available": False,
+        "source": {"type": "local", "profilesDiscovered": profiles_discovered},
+        "agents": [],
+        "summary": {"totalAgents": 0, "totalCalls": 0},
+        "error": {
+            "code": CODE_HERMES_UNAVAILABLE,
+            "message": ERROR_MESSAGES[CODE_HERMES_UNAVAILABLE],
+        },
+    }
+
+
+def collect(root, lookback_days, now_epoch):
+    """Scan every profile under *root* and build the Phase 2 summary."""
     if not root.is_dir():
         note(f"profiles root not found: {root}")
-        return {
-            "schemaVersion": SCHEMA_VERSION,
-            "provider": PROVIDER,
-            "available": False,
-            "profiles": [],
-            "error": None,
-        }
+        return unavailable_record(0)
 
+    cutoff = now_epoch - max(float(lookback_days), 0.0) * SECONDS_PER_DAY
+    agents = []
     for profile_dir in sorted(root.iterdir(), key=lambda p: p.name):
         if not profile_dir.is_dir():
             continue
@@ -237,52 +348,55 @@ def collect(args):
             continue
         records = load_profile(profile_dir)
         if records is None:
-            profiles.append({
-                "agent": name,
-                "displayName": read_profile_display_name(profile_dir),
-                "records": [],
+            agents.append({
+                "id": name,
+                "displayName": read_profile_display_name(profile_dir) or name,
+                "models": [],
+                "totalCalls": 0,
+                "lastActivityAt": None,
                 "error": {
                     "code": CODE_PROFILE_UNREADABLE,
                     "message": ERROR_MESSAGES[CODE_PROFILE_UNREADABLE],
                 },
             })
             continue
-        profiles.append({
-            "agent": name,
-            "displayName": read_profile_display_name(profile_dir),
-            "records": records,
-            "error": None,
-        })
+        agents.append(
+            summarize_agent(name, read_profile_display_name(profile_dir),
+                            records, cutoff)
+        )
 
-    # Data from at least one profile wins; per-profile errors are carried in
-    # that profile's own error object, never hidden behind the top level.
-    available = any(p["records"] for p in profiles)
+    # ``totalAgents`` counts agents with actual included activity; a
+    # discovered-but-quiet profile still appears in ``agents``.
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "provider": PROVIDER,
-        "available": available,
-        "profiles": profiles,
+        "harness": HARNESS,
+        "available": True,
+        "source": {"type": "local", "profilesDiscovered": len(agents)},
+        "agents": agents,
+        "summary": {
+            "totalAgents": sum(1 for agent in agents if agent["totalCalls"] > 0),
+            "totalCalls": sum(agent["totalCalls"] for agent in agents),
+        },
         "error": None,
     }
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Emit the Agent Fleet Hermes activity record.")
+    parser = argparse.ArgumentParser(description="Emit the Agent Fleet Hermes activity summary.")
     parser.add_argument("--root", default=str(DEFAULT_ROOT),
                         help="Hermes profiles directory (default: ~/.hermes/profiles)")
+    parser.add_argument("--lookback-days", type=float, default=DEFAULT_LOOKBACK_DAYS,
+                        help="activity lookback window in days (default: 7)")
+    parser.add_argument("--now", type=float, default=None,
+                        help="test hook: fix 'now' to an epoch-seconds value")
     args = parser.parse_args(argv)
 
+    now_epoch = args.now if args.now is not None else time.time()
     try:
-        record = collect(args)
+        record = collect(Path(args.root).expanduser(), args.lookback_days, now_epoch)
     except Exception as exc:  # a crash must still leave a parseable record
         note(f"unexpected failure: {type(exc).__name__}")
-        record = {
-            "schemaVersion": SCHEMA_VERSION,
-            "provider": PROVIDER,
-            "available": False,
-            "profiles": [],
-            "error": None,
-        }
+        record = unavailable_record(0)
 
     print(json.dumps(record, separators=(",", ":")))
     return 0
