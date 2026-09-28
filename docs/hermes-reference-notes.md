@@ -195,3 +195,49 @@ No `messages.content`, no prompt/response bodies, no `auth.json`, no tokens,
 no API keys were read or copied. The `id=resp_...` identifiers present in
 log lines are deliberately excluded from all examples and the Phase 2
 schema.
+
+## 9. Read-only side effects (verified during Task 5 final validation, 2026-09-28)
+
+Claim under test: "the collector never modifies Hermes state".
+
+Method (all read-only observation plus one controlled copy experiment):
+
+1. `sha256sum` + mtime of `state.db` and `state.db-wal` for several profiles,
+   before and after a full collector run over all 9 profiles: **unchanged**.
+2. File inventory of `~/.hermes/profiles` (depth 2) before/after a run:
+   **same file count, no new files** — a `mode=ro` open does not create
+   `-wal`/`-shm` even when they are absent (checked again on a copy of a
+   WAL-mode profile with both files removed).
+3. Controlled copy: `state.db`, `state.db-wal`, `state.db-shm` copied to
+   `/tmp`, then opened with the collector's exact URI
+   (`file:…?mode=ro`, `timeout=10`) and queried: **`-shm` mtime and content
+   unchanged**. A read-only SQLite reader does not dirty the WAL index.
+4. Live-tree observation over 45 s with **no** collector running: `-shm`
+   mtimes moved on their own (all profiles at once, Hermes' own periodic
+   cycle), which is why they also appeared to move during earlier scans.
+
+Conclusion: Phase 2 opens Hermes databases strictly read-only and writes
+nothing anywhere. **Correction to §7 item 5:** the intent was right (`mode=ro`,
+no DB/WAL writes) but the wording implied the `-shm` files could be touched by
+us; measurements show they are not — their mtime churn on a live tree is Hermes'
+own activity, and their content checksum is stable across our scans.
+
+Phase 3-relevant notes from the same pass:
+
+- The live fleet is 9 profiles with `state.db` (`.deleted/` holds removed
+  profiles and is correctly ignored: no `state.db` inside).
+- `profile.yaml` has **no top-level `title:`** on this machine; the display name
+  lives at `ui_meta.hermes-bots.title`. Profiles without `profile.yaml`
+  (e.g. `diana`) fall back to the directory name, as designed.
+- Hermes also keeps `state.db.fts_rebuild.lock` and
+  `state.db.quarantine.lock` siblings — unrelated lock files, never opened.
+- Output ordering, for the record: the collector emits `agents[]` in
+  alphabetical profile order (deterministic; asserted by
+  `test_agents_are_sorted_and_every_fixture_profile_present`) and models within
+  an agent by `calls` desc then model name. "Busiest agent first" is a
+  *display* decision in `HermesUsage.qml` (`totalCalls` desc, then display
+  name), which also drops zero-call and errored agents from the rows. Phase 3
+  correlation work must not depend on the display order.
+- Hermes' own `hermes profile list` reports a *default* per-profile model
+  (`gpt-6-terra`, `qwen3.6:35b`, `grok-4.7`, …) that has nothing to do with the
+  per-session Codex usage rows we aggregate; do not confuse the two in Phase 3.

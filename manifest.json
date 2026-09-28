@@ -5,7 +5,7 @@
   "version": "0.0.1",
   "author": "Daniluvatar",
   "license": "MIT",
-  "description": "One bar widget for your AI subscription allowance. Phase 1: Codex 5-hour and weekly limits, with the used percentage in the bar.",
+  "description": "One bar widget for your AI subscription allowance. Shows the Codex 5-hour and weekly percent used in the bar, with Hermes agent activity in the panel.",
   "kinds": [
     "bar-widget"
   ],
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Agent Fleet",
-    "description": "Codex subscription allowance in the bar: tier, 5-hour and weekly percent used, and the reset countdown, without opening another terminal.",
+    "description": "Codex subscription allowance in the bar: tier, 5-hour and weekly percent used, and the reset countdown, plus recent Hermes activity per agent and model. Activity counts only — not a share of your allowance.",
     "category": "Developer Tools",
     "aliases": [
       "agent fleet",
