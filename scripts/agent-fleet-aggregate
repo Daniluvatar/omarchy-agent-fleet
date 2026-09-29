@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Agent Fleet attribution aggregation (Phase 3, Task 5).
+
+Pure, offline aggregation of Task 4 attribution records (over Task 3
+interval records) into a summary for ONE Codex allowance window at a
+time:
+
+- primary target: ``weekly``
+- secondary:      ``session``
+- session and weekly are NEVER mixed.
+
+Reset-segment rule: only the newest contiguous segment after the most
+recent `reset_boundary` for the selected window is summarized. Gaps
+inside the segment do NOT reset it (they reduce evidence; valid
+intervals around them stay in). A reset is never bridged and nothing
+is inferred across gaps.
+
+Per-record inclusion:
+
+- ``observed_single`` / ``estimated_shared`` with a positive observed
+  delta and/or allocations -> contribute.
+- ``unattributed`` (any reason) -> its positive observed delta
+  contributes to observed and to its reason bucket.
+- ``gap`` / ``reset_boundary`` / ``no_allowance_delta`` -> contribute
+  NOTHING (no fake deltas, no zero-cost inference).
+
+Invariants (full precision, no display rounding):
+
+- ``attributedPoints + unattributedPoints == observedPoints``
+  (within deterministic floating tolerance);
+- agent/model rollups sum to ``attributedPoints`` — allocations are
+  NEVER renormalized to 100% of observed.
+
+Coverage:
+
+``coveragePercent = attributedPoints / observedPoints * 100`` when
+``observedPoints > 0``; ``null`` otherwise (no fabricated 100%).
+Coverage means "fraction of observed allowance movement that Agent
+Fleet could attribute". It does NOT mean "percentage of the
+subscription used by Hermes", a confidence score, or billing accuracy.
+
+Identities stay agent + model; an agent's models are never collapsed
+into one. Agent-level totals are provided as an additional rollup.
+Agents and models are emitted in deterministic sorted order.
+
+Offline CLI (stdout contract: EXACTLY one JSON document; diagnostics
+to stderr):
+
+    agent-fleet-aggregate --state PATH --window weekly|session [--pretty]
+
+Read-only over the observations file (chains interval + attribution
+layers). No UI, no refresh/snapshot integration.
+"""
+
+import argparse
+import json
+import sys
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+
+WINDOWS = ("session", "weekly")
+POINT_KINDS = ("observed_single", "estimated_shared", "unattributed")
+REASON_FIELDS = {
+    "no_hermes_activity": "noHermesActivityPoints",
+    "incomplete_hermes_observability":
+        "incompleteHermesObservabilityPoints",
+    "no_callable_activity": "noCallableActivityPoints",
+}
+
+
+def note(message):
+    print(f"agent-fleet-aggregate: {message}", file=sys.stderr)
+
+
+def load_sibling(name, alias):
+    path = Path(__file__).resolve().parent / name
+    loader = SourceFileLoader(alias, str(path))
+    mod = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+_ATTRIBUTION = load_sibling(
+    "agent-fleet-attribution", "af_attribution_under_aggregate")
+
+
+def window_view(interval, window):
+    """Attribution outcome + observed delta for ONE window of ONE
+    interval record."""
+    try:
+        window_attr = _ATTRIBUTION.attribute(interval)
+        outcome = window_attr["codex"][window]
+    except (KeyError, TypeError):
+        outcome = {"kind": "invalid"}
+    raw = (interval.get("codex") or {}).get(window) or {}
+    delta = raw.get("deltaPoints")
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+        delta = None
+    return {
+        "kind": outcome.get("kind") if isinstance(outcome, dict) else None,
+        "reason": outcome.get("reason") if isinstance(outcome, dict) else None,
+        "allocations":
+            outcome.get("allocations") if isinstance(outcome, dict) else None,
+        "delta": delta,
+    }
+
+
+def observed_points(view):
+    if view["kind"] in POINT_KINDS and isinstance(view["delta"], (int, float)) \
+            and view["delta"] > 0:
+        return view["delta"]
+    return 0.0
+
+
+def current_segment_intervals(intervals, window):
+    """Newest contiguous intervals after the most recent
+    reset_boundary (exclusive). Input order is chronological."""
+    views = [window_view(interval, window) for interval in intervals]
+    last_reset = max(
+        (i for i, view in enumerate(views)
+         if view["kind"] == "reset_boundary"), default=-1)
+    return intervals[last_reset + 1:]
+
+
+def summarize(window, intervals):
+    if window not in WINDOWS:
+        raise ValueError(f"unknown window: {window!r}")
+    if not isinstance(intervals, (list, tuple)):
+        raise TypeError("intervals must be a list")
+    segments = current_segment_intervals(intervals, window)
+    views = [window_view(interval, window) for interval in segments]
+    intervals = segments
+    view_iter = views
+
+    observed = 0.0
+    attributed = 0.0
+    unattributed = 0.0
+    reason_points = {name: 0.0 for name in REASON_FIELDS.values()}
+    single_total = 0.0
+    shared_total = 0.0
+    models = {}  # (agent, model) -> {"single": float, "shared": float}
+
+    for view in view_iter:
+        if view["kind"] == "reset_boundary":
+            continue  # defensive; never inside the current segment
+        op = observed_points(view)
+        observed += op
+        allocations = view.get("allocations") or []
+        if view["kind"] == "observed_single":
+            for allocation in allocations:
+                agent = allocation["agent"]
+                model = allocation["model"]
+                points = floating(allocation["allocatedPoints"])
+                key = (agent, model)
+                bucket = models.setdefault(
+                    key, {"single": 0.0, "shared": 0.0})
+                bucket["single"] += points
+                attributed += points
+                single_total += points
+        elif view["kind"] == "estimated_shared":
+            for allocation in allocations:
+                agent = allocation["agent"]
+                model = allocation["model"]
+                points = floating(allocation["allocatedPoints"])
+                key = (agent, model)
+                bucket = models.setdefault(
+                    key, {"single": 0.0, "shared": 0.0})
+                bucket["shared"] += points
+                attributed += points
+                shared_total += points
+        elif view["kind"] == "unattributed":
+            field = REASON_FIELDS.get(view.get("reason"))
+            if field is None:
+                continue
+            unattributed += op
+            reason_points[field] += op
+
+    agents = {}
+    for (agent, model), bucket in models.items():
+        agent_entry = agents.setdefault(agent, {})
+        agent_entry[model] = bucket
+
+    agents_out = []
+    for agent in sorted(agents):
+        models_out = []
+        agent_total = 0.0
+        for model in sorted(agents[agent]):
+            bucket = agents[agent][model]
+            total = bucket["single"] + bucket["shared"]
+            agent_total += total
+            models_out.append({
+                "model": model,
+                "observedSinglePoints": bucket["single"],
+                "estimatedSharedPoints": bucket["shared"],
+                "totalAttributedPoints": total,
+            })
+        agents_out.append({
+            "agent": agent,
+            "models": models_out,
+            "totalAttributedPoints": agent_total,
+        })
+
+    start_at = None
+    end_at = None
+    if intervals:
+        start_at = intervals[0].get("startAt")
+        end_at = intervals[-1].get("endAt")
+
+    coverage = (attributed / observed * 100.0) if observed > 0 else None
+
+    return {
+        "schemaVersion": 1,
+        "window": window,
+        "segmentStartAt": start_at,
+        "segmentEndAt": end_at,
+        "observedPoints": observed,
+        "attributedPoints": attributed,
+        "unattributedPoints": unattributed,
+        "coveragePercent": coverage,
+        "agents": agents_out,
+        "unattributed": {
+            "noHermesActivityPoints":
+                reason_points["noHermesActivityPoints"],
+            "incompleteHermesObservabilityPoints":
+                reason_points["incompleteHermesObservabilityPoints"],
+            "noCallableActivityPoints":
+                reason_points["noCallableActivityPoints"],
+        },
+        "evidence": {
+            "observedSinglePoints": single_total,
+            "estimatedSharedPoints": shared_total,
+        },
+    }
+
+
+def floating(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"not a number: {value!r}")
+    return float(value)
+
+
+def main(argv=None):
+    import os
+
+    parser = argparse.ArgumentParser(
+        description="Aggregate Phase 3 attributions for one Codex "
+                    "allowance window (pure, read-only, no UI).",
+    )
+    parser.add_argument("--state", type=Path, default=None,
+                        help="observations.jsonl to read (never modified)")
+    parser.add_argument("--window", choices=WINDOWS, default="weekly",
+                        help="which Codex window to aggregate "
+                             "(default: weekly)")
+    parser.add_argument("--pretty", action="store_true")
+    args = parser.parse_args(argv)
+
+    intervals_module = load_sibling(
+        "agent-fleet-intervals", "af_intervals_under_aggregate")
+
+    xdg = os.path.abspath(os.environ.get("XDG_STATE_HOME", "").strip())
+    if not xdg:
+        xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+    default = Path(xdg) / "omarchy" / "agent-fleet" / "observations.jsonl"
+    state = args.state or default
+
+    observations = []
+    if state.is_file():
+        for line in state.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                observations.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    intervals = intervals_module.build_intervals(observations)
+    payload = summarize(args.window, intervals)
+    if args.pretty:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
