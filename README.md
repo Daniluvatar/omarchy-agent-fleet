@@ -1,14 +1,23 @@
 # Omarchy Agent Fleet
 
 An Omarchy shell plugin that puts your AI coding subscription allowance in the
-bar — one number visible at a glance, full details one click away — and, since
-Phase 2, shows what your Hermes bots have actually been doing next to it.
+bar — one number visible at a glance, full details one click away — shows what
+your Hermes bots have actually been doing next to it (Phase 2), and since
+Phase 3 infers — clearly labeled, never as billing — which agent and model the
+observed Codex allowance movement most plausibly belongs to.
 
-**Status: Phase 2 complete.** Codex subscription allowance display (Phase 1) and
-Hermes activity display (Phase 2) are implemented end-to-end — bar slot + panel
-+ two local collectors + offline tests — and run live against the author's
-Omarchy install. Allowance *attribution* (which bot used how much of the
-subscription) is **not** implemented; see [Phase 3](#future-direction-roadmap).
+**Status: Phase 3 complete, live-tested on this system.** Codex subscription
+allowance display (Phase 1) and Hermes activity display (Phase 2) are
+implemented end-to-end — bar slot + panel + two local collectors + offline
+tests — and run live against the author's Omarchy install. Phase 3 adds a
+user-only observation store and a chain of four pure, offline CLI stages that
+turn observed Codex allowance *movement* into per-agent / per-model *inferred
+attribution*, with an explicit unattributed remainder and a coverage figure
+that says exactly what it is and is not. The attribution numbers are
+correlation from local observability — **not provider-reported per-agent
+billing data**, not a share of the subscription, and not a confidence score.
+See the [Phase 3](#phase-3--allowance-attribution-inferred-not-provider-reported) section
+for the full rules.
 
 Plugin id: `io.github.daniluvatar.agent-fleet` · Kind: `bar-widget` ·
 License: [MIT](LICENSE) · Author: Daniluvatar
@@ -20,7 +29,8 @@ is a single static glyph (`󱚣`) — every number lives inside the popup, and t
 only at-a-glance signal is a colour change that stays silent below 90 % used.
 Agent Fleet exists to answer "how much of my allowance have I used?" at a
  glance, without clicking anything — and, with the fleet of Hermes bots on this
-machine, "who has been burning it?" one step away from being answerable.
+machine, "who has been burning it?" one click away, answered as *inferred*
+attribution (never as billing — see the Phase 3 section).
 
 ## What it is
 
@@ -51,14 +61,18 @@ Codex Plus                      ← Provider / subscription  (Phase 1: allowance
         └── GPT-6 Luna
 ```
 
-**Both sides of the hierarchy now carry live data; the edge between them does
-not.** Allowance is read at the *provider/subscription* level (first-party
-Omarchy integration); activity is read at the *agent* and *model* levels (each
-Hermes profile's local state database). Nothing yet links a Hermes agent's calls
-to a percentage of the Codex allowance, and no part of the UI implies it. A
-Hermes agent that has no Codex activity (or runs entirely on other providers)
-can coexist with a nearly-exhausted Codex allowance, and the panel will show
-both numbers without reconciling them — by design, until Phase 3.
+**Both sides of the hierarchy now carry live data; the edge between them is
+an *inference*, labeled as such — not a measurement.** Allowance is read at
+the *provider/subscription* level (first-party Omarchy integration); activity
+is read at the *agent* and *model* levels (each Hermes profile's local state
+database). Phase 3 deliberately links the two, and only as inference: the
+*weekly observed allowance movement* is attributed to the `agent + model`
+identities that local evidence can tie to it — and movement that cannot be
+tied to anything stays unattributed, explicitly, never scaled, never
+invented. A Hermes agent with no Codex activity (or running entirely on other
+providers) may coexist with a nearly-exhausted Codex allowance, and the panel
+shows both — with the shortfall sitting in *Unattributed*, not assigned by
+guess.
 
 ## Three different numbers — do not read one as another
 
@@ -66,7 +80,7 @@ both numbers without reconciling them — by design, until Phase 3.
 |---|---|---|---|
 | **Codex allowance** | Percent of the 5-hour and weekly subscription windows *used*, plus reset countdowns | first-party `omarchy-agent-usage-codex --limits-only` (authenticated local Codex integration) | **implemented (Phase 1)** |
 | **Hermes activity** | Counts of successful Codex-backed model calls per Hermes agent/model in the last 7 days (calls, input/output/cache tokens, last activity) | each profile's `state.db`, read-only | **implemented (Phase 2)** |
-| **Allowance attribution** | How much of the Codex allowance a given agent/model consumed | requires correlating allowance snapshots with activity intervals | **not implemented (Phase 3)** |
+| **Allowance attribution** | Which `agent + model` the *observed* weekly Codex allowance movement is inferred to belong to (in pp of that movement) | inference: allowance observation store × local activity intervals | **implemented as inference (Phase 3)** |
 
 The two live numbers are **not two views of the same measurement**. The
 allowance percentage is authoritative for the subscription; the Hermes numbers
@@ -100,7 +114,8 @@ separate sections, and the panel says so out loud:
   reports an error, the panel shows a single `Usage unavailable — authenticate
   with Codex and try again` line. No raw upstream text, exceptions, or diagnostics
   are ever shown in the UI.
-- Right-click the bar slot to force a refresh (refreshes both sections).
+- Right-click the bar slot to force a refresh (refreshes all sections, and arms
+  at most one snapshot).
 
 ## Phase 2 capability — Hermes activity
 
@@ -220,7 +235,8 @@ separate sections, and the panel says so out loud:
   `No Codex activity in the last 7 days` when nothing qualifies; an unreadable
   profile is reported per-profile by the collector and counted in the meta line
   (`… · 1 unreadable`) without taking the other profiles down. Hermes rows
-  never feed the bar percentage, the window bars, or any attribution.
+  never feed the bar percentage or the window bars; in Phase 3 they feed only
+  the *inferred* Weekly Attribution section, as correlation.
 - **Refresh cadence is shared with Codex** — one `refresh()` drives both
   collectors on the same timer, so there is no extra polling. Hermes is a local
   scan (~50 ms measured) and runs under its own 30-second watchdog; a failed
@@ -300,11 +316,15 @@ Phase 2 adds Hermes activity, and holds the same line:
   the `-shm` mtimes on a live tree move on Hermes' own cycle with no scan
   running (see
   [`docs/hermes-reference-notes.md`](docs/hermes-reference-notes.md) §9);
-- **no persistent activity database or cache** — no history store, no snapshot
-  files, nothing written anywhere by the plugin; the only state is in memory;
+- **no persistent activity database or cache** — no history store, no live
+  tree writes; the only state is in memory. (Phase 3 adds exactly one
+  user-owned observation store — see the Phase 3 section for its path,
+  retention, permissions, and what it never contains.)
 - **no network service, daemon, or additional network call** for Hermes: it is
   a local SQLite read triggered by the existing refresh timer;
-- **no allowance attribution is calculated**, in the collector or in the UI;
+- **no allowance attribution in the Phase 2 collector or UI.** Phase 3 adds
+  it as local inference from the observation store — no new network path, no
+  new credentials, no billing computation.
 - per-profile failures are reported as fixed codes with fixed human-readable
   messages (`HERMES_UNAVAILABLE`, `HERMES_PROFILE_UNREADABLE`); paths and
   exception details stay on stderr and are never rendered;
@@ -321,12 +341,23 @@ omarchy-agent-fleet/
 ├── Panel.qml                 bar widget + panel (entryPoints.barWidget)
 ├── CodexUsage.qml            Phase 1 data source: allowance record from agent-fleet-codex
 ├── HermesUsage.qml           Phase 2 data source: activity record from agent-fleet-hermes
+├── AttributionUsage.qml      Phase 3 data source: runs the intervals→attribution→
+│                             aggregate chain read-only for the Weekly Attribution section
 ├── scripts/
 │   ├── agent-fleet-codex     Codex allowance collector (Python 3, stdlib only)
-│   └── agent-fleet-hermes    Hermes activity collector (Python 3, stdlib + sqlite3)
+│   ├── agent-fleet-hermes    Hermes activity collector (Python 3, stdlib + sqlite3)
+│   ├── agent-fleet-snapshot  Phase 3 store writer: one settled observation per refresh wave
+│   ├── agent-fleet-intervals Phase 3: observations → interval records (pure)
+│   ├── agent-fleet-attribution Phase 3: intervals → attribution records (pure)
+│   └── agent-fleet-aggregate Phase 3: per-window rollup (pure)
 ├── tests/
 │   ├── test_agent_fleet_codex.py
 │   ├── test_agent_fleet_hermes.py
+│   ├── test_agent_fleet_snapshot.py       Phase 3 store (path/permissions/retention/spacing/privacy)
+│   ├── test_agent_fleet_intervals.py      Phase 3 boundary/gap/reset semantics
+│   ├── test_agent_fleet_attribution.py    Phase 3 categories + invariants
+│   ├── test_agent_fleet_aggregate.py      Phase 3 rollups, pp, coverage
+│   ├── test_agent_fleet_failure_recovery.py Phase 3 fail-safe behavior
 │   ├── make_hermes_fixtures.py        regenerates the synthetic Hermes DBs
 │   └── fixtures/
 │       ├── codex-normal.json / codex-unavailable.json / codex-malformed.json
@@ -334,6 +365,7 @@ omarchy-agent-fleet/
 ├── docs/
 │   ├── phase-1-playbook.md            the Phase 1 ticket
 │   ├── omarchy-agent-fleet-phase-2.md the Phase 2 ticket
+│   ├── phase-3-attribution-notes.md   Phase 3 discovery notes (source-of-truth decision, verified commands)
 │   ├── reference-notes.md             verified local Omarchy/Codex findings
 │   └── hermes-reference-notes.md      verified local Hermes source findings
 ├── LICENSE                   MIT
@@ -391,14 +423,17 @@ the deliberate `omarchy plugin enable` step.
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-64 tests (27 Codex, 37 Hermes), all offline, stdlib only; nothing reads the live
-`~/.hermes` tree, the Codex integration, or the network. Hermes tests run
+151 tests — 27 Codex, 37 Hermes, 26 snapshot, 24 intervals, 17 attribution,
+19 aggregate, 1 failure-recovery — all offline, stdlib only; nothing reads
+the live `~/.hermes` tree, the Codex integration, or the network. Hermes
+tests run
 against a synthetic profile tree in `tests/fixtures/hermes-profiles/`
 (engineer / oracle / scribe / diana), regenerable with
 `tests/make_hermes_fixtures.py`; `diana` deliberately exercises the identity
 fallbacks (empty `profile.yaml`, no `title:`), and the fixture `messages` table
 has no `content` column at all, so a test could not read a message body even if
-someone tried.
+someone tried. The Phase 3 chain tests always run against a temporary
+`$XDG_STATE_HOME`/temp dir store and never touch `~/.local/state`.
 
 **Codex collector:** contract shape and one-JSON-document stdout; fraction →
 percent mapping (`0.03` → `3.0`, `1.0` → `100.0`) with `0.0` kept as a real
@@ -421,11 +456,34 @@ failure modes (missing root → unavailable, empty root → available but quiet,
 corrupt DB isolated per profile, profile without `state.db` reported not fatal);
 unit helpers; and determinism (same input → same output).
 
+**Phase 3 attribution chain:** `test_agent_fleet_snapshot.py` (store path /
+`XDG_STATE_HOME` fallback, `0700`/`0600` permissions, atomic append + rename,
+14-day retention pruning, ~60 s minimum spacing, baseline-only first
+observation, and store privacy — no prompt/response content, credentials, raw
+log lines, or raw error text: only fixed codes like `CODEX_UNAVAILABLE`);
+`test_agent_fleet_intervals.py` (gap and `reset_boundary` semantics, first
+observation never yields a delta, a later-lower `usedPercent` or changed
+`resetsAt` is a reset, never a negative delta, a reappearing profile with
+higher lifetime counters is unknown, not invented);
+`test_agent_fleet_attribution.py` (every rule: `gap`, `reset_boundary`,
+`no_allowance_delta`, `unattributed` with its three reasons, `observed_single`,
+`estimated_shared`; partial observability blocks the whole delta; allocations
+weight by `deltaCalls` only; `attributed ≤ observed`; no confidence scores;
+weekly and session never mixed);
+`test_agent_fleet_aggregate.py` (rollups sum to `attributedPoints`,
+unattributed remainder stays unattributed, coverage = attributed/observed or
+`null`, never a fabricated 100 %);
+`test_agent_fleet_failure_recovery.py` (collector or store failure at any
+stage keeps the pipeline and the panel alive — diagnostic only).
+
 ## Known limitations
 
-- **Activity, not attribution.** Hermes numbers and Codex allowance numbers are
-  not correlated. Any statement of the form "Engineer used 31 % of the weekly
-  allowance" would be false and is deliberately impossible in this codebase.
+- **Attribution is inference, not billing.** Phase 3 correlates the observed
+  allowance movement with local activity counters — but a statement of the form
+  "Engineer *used* 31 % of the weekly allowance* as the provider counts it*"
+  is still false, and still impossible in this codebase: it is inferred from
+  local observability, it is bounded by the observed movement, and everything
+  the local evidence cannot tie down stays unattributed.
 - **The Hermes DB format is an internal implementation detail** of Hermes with
   no public contract; a Hermes update can rename tables or columns. The parser
   fails soft (per-profile error, or `available: false`) rather than crashing,
@@ -450,23 +508,202 @@ unit helpers; and determinism (same input → same output).
 - **The Codex allowance can be intermittently unavailable.** The first-party
   integration sometimes answers `limits: []` / `"Codex limits unavailable"`
   (seen repeatedly on 2026-09-28, recovering on the next refresh). The
-  collector maps that to the documented unavailable state instead of guessing,
-  and — unlike Hermes — the Codex section does not hold a last-good record
-  across a failed refresh. Holding the last-good allowance with a staleness
-  marker is a Phase 3-sized change, not a Phase 2 bug.
+  collector maps that to the documented unavailable state instead of guessing.
+  When a refresh settles with a previously confirmed record already on
+  screen, the panel now retains that last-good value and flags it stale
+  ("Last successful update HH:MM") instead of blanking; with no prior good
+  record the section simply shows unavailable. That stale continuity is
+  display-only: the Phase 3 snapshot store re-collects fresh on every capture,
+  so the same failed refresh is recorded there as `codex.available = false`
+  and produces a gap in the interval/attribution chain — the UI is never
+  allowed to paper over a break in the data.
 - The first-party collector's `--limits-only` touches its own cache/state under
   `~/.local/state/omarchy/agents/usage/` — Omarchy-owned behaviour we rely on,
   not something we write ourselves.
 - No history, charts, burn-rate, per-session drill-down, or configuration UI.
 
+## Phase 3 — allowance attribution (inferred, not provider-reported)
+
+> **Read this first:** *Agent Fleet attribution is inferred from observed
+> Codex allowance movement and local Hermes activity. It is not a
+> provider-reported per-agent billing figure.* The provider reports the
+> *shared* Codex subscription allowance; it does not report how each local
+> agent split it. Every number in this section is built entirely from local
+> signals — the allowance record and the Hermes activity counters — so
+> "observed", "estimated" and "unattributed" are never charges, costs, or
+> provider accounting. They are labeled in the panel next to the numbers,
+> and the code paths are built to keep it that way.
+
+Three conservative integrations. The bar, the two existing data flows, and
+the panel's look are unchanged; the new machinery is four pure CLI stages
+plus one read-only QML source:
+
+```text
+settled refresh wave (900 s timer / manual / panel reopen)
+    ├── CodexUsage.refresh()   > agent-fleet-codex   (allowance, pp)
+    └── HermesUsage.refresh()  > agent-fleet-hermes  (activity counters)
+            │ once the wave has settled, exactly once
+            ▼
+    agent-fleet-snapshot        fresh collection → append ONE observation
+                                $XDG_STATE_HOME/omarchy/agent-fleet/observations.jsonl
+            │ everything below here is read-only
+            ▼
+    agent-fleet-intervals       consecutive observations → interval records
+            ▼
+    agent-fleet-attribution     per window (weekly | session, independently)
+            ▼
+    agent-fleet-aggregate       one-window rollup: observed / attributed /
+                                unattributed (pp), coverage, agent+model rollups
+            ▼
+    AttributionUsage.qml        runs the same chain read-only → the
+                                "Weekly Attribution" section (render-only)
+```
+
+- **Snapshot capture.** Each refresh wave (the 900 s cadence timer, a manual
+  refresh, or a panel re-opening — all of them refresh, none of them
+  redraw) settles through both collectors; exactly once per wave a
+  settled refresh arms `scripts/agent-fleet-snapshot`, which does its own
+  fresh collection and appends one observation to
+  `~/.local/state/omarchy/agent-fleet/observations.jsonl`
+  (`$XDG_STATE_HOME/omarchy/agent-fleet/observations.jsonl`). The store is
+  user-only: `0700` directory / `0600` file, atomic write (temp file +
+  `fsync` + rename), 14-day retention pruned on every write, and a ~60 s
+  minimum spacing enforced inside the store. A failed or duplicate capture is
+  diagnostic only and never disturbs the panel or the collector records.
+  Each observation is ~3 KB (the Codex window state plus the cumulative
+  `openai-codex` usage counters per profile/model), so the default cadence
+  is ≈ 300 KB/day, hard-capped around ≈ 4 MB by the 14-day window. What an
+  observation is *never* given: prompts, responses, session ids, task
+  buckets, credentials, raw log lines, raw error strings (only fixed codes
+  such as `CODEX_UNAVAILABLE`), or raw upstream text.
+- **Stale Codex handling** as noted in the known limitations above —
+  including that the last-good value is in-memory and per-shell: **after an
+  OmniShell restart, a first refresh that fails has no last-good value to
+  show (the section is just unavailable until the next success)**. The
+  store's view of the same failure is a `codex.available = false`
+  observation → a gap in the interval chain, never backfilled.
+- **Panel scrolling.** The content was already inside a `Flickable`; this
+  adds the same two reachability affordances the first-party agents panel
+  uses, so every section stays reachable with a dozen Hermes agents: a
+  vertical `ScrollBar` shown when needed, and ArrowUp/ArrowDown, `j`/`k`
+  scrolling with the first-party step size and clamping. Scrolling only
+  moves the viewport; it never triggers a refresh or a snapshot.
+- **Weekly Attribution section (inferred only).** The panel shows a clearly
+  separate third section, fed by `AttributionUsage.qml` — a read-only data
+  source that runs the repo's own aggregation chain
+  (`scripts/agent-fleet-intervals` + `scripts/agent-fleet-attribution` +
+  `scripts/agent-fleet-aggregate --window weekly`) against the snapshot
+  store. Parsing and aggregation never live in `Panel.qml`; the panel only
+  renders. It shows *Observed movement: N pp*, *Coverage: N%*, per-agent
+  (and model) *N pp observed · N pp estimated*, and a compact
+  *Unattributed: N pp* breakdown by reason. It explains itself
+  ("Inferred from Codex allowance changes and local Hermes activity") and
+  keeps coverage honest: the share of observed movement that could be
+  attributed, not a share of the subscription, not a confidence score. The
+  agent breakdown is never normalized to 100 percentage points. States:
+  *Collecting attribution data…* (no store or no intervals yet),
+  *New weekly window — collecting data…* (a reset happened and there are
+  still no usable post-reset intervals), *Attribution incomplete — Codex
+  observations contain gaps.* (the current weekly segment has gaps; the
+  valid attribution is still shown, nothing is inferred across the break).
+  It refreshes once per settled wave — never on open/redraw — only reads the
+  store, and never arms or creates its own snapshots.
+  The session window is attributed by the same engine for CLI consumers
+  (`--window session`); the panel displays the weekly section only, and the
+  two windows are never mixed into one number.
+
+### Attribution semantics (enforced by `agent-fleet-attribution`)
+
+Per Codex window (weekly and session are operated on independently,
+never mixed), over the current reset segment:
+
+1. Codex `gap` (either endpoint unreadable) → `gap`. A gap is displayed as a
+   break; it's never bridged, filled, or inferred across. A gap reduces the
+   evidence within a segment but doesn't reset the segment.
+2. Codex `reset_boundary` (a `resetsAt` move, or a subsequent `usedPercent`
+   below the previous one) → `reset_boundary`. That delta is unknown — a new
+   segment starts here; any valid intervals from before the reset still count.
+3. `ok` with delta ≤ 0 → `no_allowance_delta`. No consumption is inferred —
+   an unchanged or lower-allowance delta is never attributed as use, and no
+   "zero-provider-cost" inference is made or recorded.
+4. `ok` with a positive delta but incomplete Hermes observability (a
+   profile unreadable at either endpoint, or any `agent + model` whose
+   counter delta is not computable) → the entire delta is `unattributed`
+   (`incomplete_hermes_observability`). Partial visibility is never treated
+   as complete.
+5. `ok`, fully observable, but no Hermes activity in the interval →
+   `unattributed (`no_hermes_activity`)`; with only token movement (no
+   attributable calls) → `unattributed (`no_callable_activity`)`.
+6. `ok`, fully observable, exactly one `agent + model` with an attributable
+   delta → `observed_single`: the full observed delta is attributed to that
+   identity — *observed correlatively, never as provider billing.*
+7. `ok`, fully observable, multiple identities attributable →
+   `estimated_shared`: split by weight of **call count only**
+   (`delta * calls_i / sum(calls)`); zero-call rows don't take weight;
+   input/output/cache token deltas are *never* used as cost weights;
+   no model multipliers.
+
+Invariants across all rules: identity is always `agent + model` (never just
+agent, never just model); allocations sum back to the observed delta within
+float tolerance; `attributed ≤ observed` (never more); unattributed movement
+stays unattributed — it's never re-normalized to 100% or absorbed into
+someone else; and no numeric confidence score of any kind exists anywhere in
+the chain.
+
+### Coverage — what the number is/isn't
+
+The panel shows `Coverage: N%`, defined exactly as
+`attributedPoints / observedPoints × 100` over the current segment (or `null`
+when there is no observed movement — no fabricated 100%):
+
+- **not** provider-reported usage (the provider reports the total allowance,
+  not per-agent usage);
+- **not** a confidence score about the underlying activities being real;
+- **not** a claim that unattributed movement belongs to "no one" — it belongs
+  to *known specific unknowns* (resets, gaps, unobservable identities, or
+  Codex activity that never shows up in local Hermes counters);
+- **not** a share of the subscription (the denominator is observed movement,
+  not the 5-hour or weekly window).
+
+`Coverage: 71%` without this framing is a defect; the panel prints the
+definition right next to the number.
+
+### Live verification (Phase 3, on this system)
+
+- 151 offline unit tests (7 modules) pass; `omarchy plugin validate .`
+  exits 0; all six CLI scripts were run successfully from a clean worktree;
+  `git diff --check` clean (no whitespace errors).
+- The installed plugin is a symlink to this repo, so the live shell is
+  running exactly this tree. Live session: the panel opens and renders all
+  three sections (Codex, Hermes Activity, Weekly Attribution) with zero QML
+  errors and no agent-fleet / AttributionUsage crashes in
+  `journalctl -t omarchy-shell`; the scroll affordances (Flickable +
+  ScrollBar + `j`/`k` / ArrowUp/Down handlers) compile and load, but
+  keystroke-driven scrolling was not exercised in the live check (no
+  key-injection in the session); the panel's attribution values match what
+  `agent-fleet-aggregate --window weekly` reports against the same store.
+- Every settled refresh wave appended exactly one observation (no burst on
+  redraw); the ~60-second minimum spacing is observable in the file;
+  directory/file permissions were `0700`/`0600` throughout;
+  a grep of the store lines for prompt content, credentials, and raw error
+  text found nothing.
+- The intermittent upstream `CODEX_UNAVAILABLE` state behaved as designed:
+  the panel kept the last-good value flagging as stale; the store recorded a
+  gap; the affected interval's attribution stayed `gap` / coverage-reduced —
+  nothing was backfilled.
+
+See `docs/phase-3-attribution-notes.md` for the verification notes
+(source-of-truth decisions, verified command shapes, fixture inventory)
+that this section summarizes.
+
 ## Future direction (roadmap, not implemented)
 
-- **Phase 3 — allowance attribution:** Codex allowance snapshots + Hermes
-  activity intervals → observed/estimated agent + model contribution, keeping
-  directly observed deltas separate from estimated allocations and recording
-  ambiguity when several agents/models are active in one interval.
-- Hermes activity from additional providers (Claude, Grok, Copilot, local), and
-  other harnesses such as OpenClaw and Pi.
+- **Phase 4 — attribution UX polish:** per-agent expand/collapse, visible
+  reset/segment boundary markers, a session-window view in the panel (the
+  engine already supports it), and a compact per-segment history
+  (coverage and pp per completed segment) in the store-backed form.
+- Hermes activity for additional providers (Claude, Grok, Copilot, local)
+  and other harnesses (e.g. OpenClaw, Pi).
 - Historical allowance snapshots and a local history store; burn-rate
   analytics, forecasting, charts, export/reporting.
 - Cross-machine sync.
@@ -477,6 +714,9 @@ unit helpers; and determinism (same input → same output).
   field mapping, rotation, risks, read-only side effects.
 - `docs/omarchy-agent-fleet-phase-2.md` — the Phase 2 ticket (contract, tasks,
   validation checklist).
+- `docs/phase-3-attribution-notes.md` — the Phase 3 discovery notes
+  (source-of-truth decision: cumulative counters in `state.db` rather than
+  `agent.log`, verified command shapes, fixture inventory).
 - `docs/reference-notes.md` — everything verified locally about manifest format,
   directory layout, entry points, `Process`/timer patterns and the Codex record.
 - `docs/phase-1-playbook.md` — the Phase 1 ticket.

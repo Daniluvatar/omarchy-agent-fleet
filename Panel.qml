@@ -19,6 +19,14 @@ import qs.Ui
 // The panel also carries a Hermes Activity section fed by HermesUsage
 // (scripts/agent-fleet-hermes). Hermes rows are activity counts only; they
 // never feed the bar percentage, the window bars, or any attribution.
+//
+// Phase 3 adds a third, clearly separate section — Weekly Attribution —
+// fed by AttributionUsage, a read-only source over the snapshot store that
+// renders the repo's own aggregation chain (agent-fleet-intervals +
+// agent-fleet-aggregate --window weekly). It is inferred only: estimated,
+// unattributed, and coverage never read as provider-billed truth, and the
+// section refreshes once per settled refresh wave without arming or
+// creating a snapshot of its own.
 Panel {
   id: root
   moduleName: "io.github.daniluvatar.agent-fleet"
@@ -88,6 +96,11 @@ Panel {
   readonly property bool hermesReady: hermesUsage.dataState === "ready"
   readonly property bool hermesLoading: hermesUsage.dataState === "loading"
 
+  // Phase 3: Weekly Attribution — its own data source (AttributionUsage),
+  // read-only over the snapshot store. The panel never aggregates inline;
+  // the section below just renders what the source exposes.
+  readonly property var attributionUsage: AttributionUsage {}
+
   function formatPercent(p) {
     if (p === null || p === undefined)
       return ""
@@ -156,10 +169,74 @@ Panel {
   }
 
   function refresh() {
+    // Only a refresh wave arms a snapshot attempt. Redraws, re-activation
+    // without refresh, and any property invalidation never arm one, so UI
+    // redraws can never create observations.
+    root.snapshotArmed = true
     if (codexUsage && codexUsage.refresh)
       codexUsage.refresh()
     if (hermesUsage && hermesUsage.refresh)
       hermesUsage.refresh()
+  }
+
+  // -------------------------------------------------- Phase 3 snapshot capture
+  // One conservative attempt per refresh wave, and only after BOTH collectors
+  // have settled for that wave. The snapshot store does its own fresh
+  // collection (a failed Codex refresh therefore lands as codex.available
+  // = false — a gap — never as a copy of the stale UI record), enforces the
+  // ~60 s minimum spacing against the newest observation, and fails
+  // diagnostically without touching the panel.
+  readonly property var snapshotCommand:
+      [Qt.resolvedUrl("scripts/agent-fleet-snapshot").toString().replace(/^file:\/\//, "")]
+
+  property bool snapshotArmed: false
+
+  Connections {
+    target: codexUsage
+    // Modern function syntax (property-form onFoo in Connections is
+    // deprecated and logs a warning on every scene load).
+    function onSettled() { root.maybeSnapshot() }
+  }
+
+  Connections {
+    target: hermesUsage
+    function onSettled() { root.maybeSnapshot() }
+  }
+
+  function maybeSnapshot() {
+    if (!root.snapshotArmed)
+      return
+    if (codexUsage && codexUsage.refreshing)
+      return
+    if (hermesUsage && hermesUsage.refreshing)
+      return
+    root.snapshotArmed = false
+    if (!snapshotProcess.running) {
+      snapshotProcess.command = root.snapshotCommand
+      snapshotProcess.running = true
+    }
+    // After the wave has settled (this is the only call site), recompute
+    // the attribution view from the store. Read-only: it can never arm a
+    // snapshot or refresh a collector, so no recursion, no extra capture.
+    if (root.attributionUsage && root.attributionUsage.refresh)
+      root.attributionUsage.refresh()
+  }
+
+  Process {
+    id: snapshotProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+    }
+    onExited: function(code, signal) {
+      // Conservative by contract: a failed or spacing-skipped capture is
+      // diagnostic only. It never throws, never changes the panel state,
+      // and never disturbs the collector records.
+    }
   }
 
   // Bar slot: Codex percent when one is reported and the setting allows it,
@@ -184,7 +261,12 @@ Panel {
     }
     if (windows.length === 0)
       return codexUsage.fetchedAtMs !== 0 ? "Updated " + formatClock(codexUsage.fetchedAtMs) + "  ·  no window data" : "No window data"
-    return codexUsage.fetchedAtMs !== 0 ? "Updated " + formatClock(codexUsage.fetchedAtMs) + "  ·  " + parts.join("   ") : parts.join("   ")
+    var partsLine = parts.join("   ")
+    if (codexUsage.stale)
+      // Stale continuity: last-good value still visible, flagged, with when
+      // it was last confirmed.
+      return "Last successful update " + (formatClock(codexUsage.lastGoodMs !== 0 ? codexUsage.lastGoodMs : codexUsage.fetchedAtMs)) + "  ·  " + partsLine
+    return codexUsage.fetchedAtMs !== 0 ? "Updated " + formatClock(codexUsage.fetchedAtMs) + "  ·  " + partsLine : partsLine
   }
 
   // ------------------------------------------------------- bar button
@@ -228,6 +310,14 @@ Panel {
       anchors.fill: parent
 
       onCloseRequested: root.close()
+      onMoveRequested: function (dx, dy) {
+        // First-party pattern (see the agents panel): arrows are the panel's
+        // scroll mechanism; same step size and clamping expression.
+        if (dy !== 0)
+          flick.contentY = Math.min(
+              Math.max(0, flick.contentY + dy * Style.space(56)),
+              Math.max(0, flick.contentHeight - flick.height))
+      }
       onActivateRequested: root.refresh()
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (t) {
@@ -244,6 +334,7 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
           id: content
@@ -486,6 +577,129 @@ Panel {
               opacity: 0.8
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSeparator { width: parent.width }
+
+          // Weekly Attribution (Phase 3): inferred attribution only.
+          // All parsing/values live in AttributionUsage; this block only
+          // renders. It is separate from the allowance above and must never
+          // read back as provider-billed truth.
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "Weekly Attribution"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: root.attributionUsage.explanationLine
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // Empty / waiting states. Deliberately unadorned: no zeros are
+            // rendered as if they were evidence before data exists.
+            Text {
+              visible: root.attributionUsage.statusText !== ""
+              width: parent.width
+              text: root.attributionUsage.statusText
+              color: (root.attributionUsage.dataState === "ready" ? root.urgent : root.dim)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              // Shown whenever usable attribution data exists — including
+              // when a mid-segment gap requires the "Attribution incomplete"
+              // note above it: valid attribution within the same reset
+              // segment is retained, never dropped.
+              visible: root.attributionUsage.ready
+              width: parent.width
+              spacing: Style.space(4)
+
+              Text {
+                text: root.attributionUsage.observedText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+
+              Text {
+                text: root.attributionUsage.coverageText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Repeater {
+                model: root.attributionUsage.agentRows
+                delegate: Column {
+                  width: parent.width
+                  spacing: Style.space(1)
+
+                  Text {
+                    text: "  " + modelData.name
+                    color: root.foreground
+                    opacity: 0.9
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Repeater {
+                    model: modelData.models
+                    delegate: Row {
+                      spacing: Style.space(4)
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "    " + modelData.name
+                        color: root.foreground
+                        opacity: 0.75
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.attributionUsage.formatPoints(modelData.observed) + " pp observed · "
+                             + root.attributionUsage.formatPoints(modelData.estimated) + " pp estimated · "
+                             + root.attributionUsage.formatPoints(modelData.total) + " pp total"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+                }
+              }
+
+              Text {
+                visible: root.attributionUsage.unattributedLine !== ""
+                width: parent.width
+                text: root.attributionUsage.unattributedLine
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                visible: root.attributionUsage.hasAgentRows
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: root.attributionUsage.coverageFootnote
+                color: root.faint
+                opacity: 0.8
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
             }
           }
 

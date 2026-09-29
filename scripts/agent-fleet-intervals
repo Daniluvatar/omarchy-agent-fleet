@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Agent Fleet interval builder (Phase 3, Task 3).
+
+PURE interval layer over consecutive Phase 3 observations
+(``agent-fleet-snapshot`` JSONL lines). No attribution, no UI, no
+snapshot capture, no state mutation here: it only turns a pair of
+consecutive observations into one interval record, or declines
+(``None``) when the endpoints do not support an interval at all.
+
+Rules implemented exactly (checkpoint 2A contract):
+- First snapshot is baseline only: an interval needs a valid earlier
+  endpoint; equal or reversed timestamps produce no record.
+- Codex window missing/unusable at *either* endpoint -> ``gap`` for that
+  window.
+- Codex usedPercent decrease at B, or a reset-window identity change
+  (``resetsAt``), -> ``reset_boundary`` for that window, delta unknown.
+- Session and weekly codex windows are evaluated independently; a reset
+  in one does not invalidate the other unless the data requires it.
+- Hermes profile readable at both endpoints -> counters may be
+  differenced (per model); a counter decrease for that identity is
+  continuity-unknown (never negative, never fabricated).
+- Profile unreadable at either endpoint -> the whole profile's interval
+  activity is unknown; no deltas are emitted for it.
+- Profile newly discovered at B -> baseline only; its cumulative
+  counters are NOT interval activity.
+- Profile present at A, absent at B -> continuity unknown; no
+  negative/zero assumptions are emitted.
+- New model under an already-readable profile at a point where A
+  readably observed the profile -> B's counters are interval activity
+  for that model (A could not have missed them).
+- ``last_activity_at`` staleness is never consulted by this layer.
+
+Record schema (one JSON object per consecutive pair that is valid):
+
+    {
+      "schemaVersion": 1,
+      "startAt": "ISO-8601 with UTC offset",
+      "endAt":   "ISO-8601 with UTC offset",
+      "status":  "complete" | "partial" | "unknown",
+      "codex": {
+        "session": {"status": "ok"|"gap"|"reset_boundary",
+                    "deltaPoints": number|null},
+        "weekly":  {"status": "ok"|"gap"|"reset_boundary",
+                    "deltaPoints": number|null}
+      },
+      "hermesKnown": true|false,
+      "activity": [
+        {"agent": "<pid>", "model": "<model>",
+         "deltaCalls": n, "deltaInputTokens": n, "deltaOutputTokens": n,
+         "deltaCacheReadTokens": n, "deltaCacheWriteTokens": n}
+      ],
+      "unknownProfiles": ["<pid>", ...],
+      "unknownIdentities": ["<pid>/<model>", ...]
+    }
+
+Status semantics:
+- ``complete``: both Codex windows are ``ok`` and every Hermes profile
+  was readable at both endpoints (nothing unknown or baselined).
+- ``unknown``: both Codex windows are ``gap`` AND the Hermes section
+  was not known at either endpoint -- no usable information at all.
+- ``partial``: everything else.
+
+Offline read-only CLI (stdout contract: EXACTLY one JSON document;
+diagnostics to stderr):
+
+    agent-fleet-intervals --state PATH [--pretty]
+
+prints ``{"intervals": [ ... ]}`` for the observations file. The file
+is only read, never written.
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+COUNTER_KEYS = ("calls", "inputTokens", "outputTokens",
+                "cacheReadTokens", "cacheWriteTokens")
+DELTA_KEYS = {"calls": "deltaCalls",
+              "inputTokens": "deltaInputTokens",
+              "outputTokens": "deltaOutputTokens",
+              "cacheReadTokens": "deltaCacheReadTokens",
+              "cacheWriteTokens": "deltaCacheWriteTokens"}
+
+
+def note(message):
+    print(f"agent-fleet-intervals: {message}", file=sys.stderr)
+
+
+def default_state_path():
+    xdg = os.path.abspath(os.environ.get("XDG_STATE_HOME", "").strip())
+    if not xdg:
+        xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(xdg) / "omarchy" / "agent-fleet" / "observations.jsonl"
+
+
+def parse_ts(value):
+    """Parse an observation timestamp that carries an explicit UTC
+    offset (or an epoch number). Naive offsets are untrusted -> None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), timezone.utc).astimezone()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+            return None
+        return parsed
+    return None
+
+
+def iso(dt):
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def valid_counter(value):
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and value >= 0)
+
+
+def validate_observation(obs):
+    if not isinstance(obs, dict):
+        return False
+    if parse_ts(obs.get("observedAt")) is None:
+        return False
+    if not isinstance(obs.get("codex"), dict):
+        return False
+    hermes = obs.get("hermes")
+    return (isinstance(hermes, dict)
+            and isinstance(hermes.get("available"), bool)
+            and isinstance(hermes.get("profiles"), dict))
+
+
+def codex_window(obs, window_name):
+    """Usable Codex window at one endpoint, as (usedPercent, resetsAt),
+    or None when missing/unusable (gap material)."""
+    section = obs["codex"]
+    if not section.get("available"):
+        return None
+    window = section.get(window_name)
+    if not isinstance(window, dict):
+        return None
+    used = window.get("usedPercent")
+    resets = window.get("resetsAt")
+    if not valid_counter(used):
+        return None
+    if not isinstance(resets, str) or not resets.strip():
+        return None
+    return (float(used), resets)
+
+
+def codex_delta(obs_a, obs_b, window_name):
+    win_a = codex_window(obs_a, window_name)
+    win_b = codex_window(obs_b, window_name)
+    if win_a is None or win_b is None:
+        # Missing/unusable at either endpoint = gap.
+        return {"status": "gap", "deltaPoints": None}
+    if win_b[1] != win_a[1] or win_b[0] < win_a[0]:
+        # Reset-window identity change or counter decrease = boundary.
+        return {"status": "reset_boundary", "deltaPoints": None}
+    return {"status": "ok",
+            "deltaPoints": round(win_b[0] - win_a[0], 6)}
+
+
+def models_of(entry):
+    if not isinstance(entry, dict):
+        return None
+    models = entry.get("models")
+    return models if isinstance(models, dict) else None
+
+
+def activity_entry(agent, model, counters):
+    entry = {"agent": agent, "model": model}
+    for key in COUNTER_KEYS:
+        entry[DELTA_KEYS[key]] = int(counters[key])
+    return entry
+
+
+def section_profiles(section):
+    if not isinstance(section, dict):
+        return None
+    profiles = section.get("profiles")
+    return profiles if isinstance(profiles, dict) else None
+
+
+def hermes_diff(obs_a, obs_b):
+    """Returns (hermes_known, activity, unknown_profiles,
+    unknown_identities). Emits no fabricated or negative deltas by
+    construction."""
+    section_a = obs_a["hermes"]
+    section_b = obs_b["hermes"]
+    profiles_a = section_profiles(section_a) \
+        if section_a.get("available") else None
+    profiles_b = section_profiles(section_b) \
+        if section_b.get("available") else None
+    if profiles_a is None or profiles_b is None:
+        # Section unknown at either endpoint: nothing here is known.
+        return (False, [], [], [])
+
+    activity = []
+    unknown_profiles = []
+    unknown_identities = []
+
+    for name in sorted(set(profiles_a) | set(profiles_b)):
+        entry_a = profiles_a.get(name)
+        entry_b = profiles_b.get(name)
+        if (entry_a is None or entry_b is None
+                or not isinstance(entry_a, dict) or not isinstance(entry_b, dict)
+                or not entry_a.get("available") or not entry_b.get("available")):
+            # New at B (baseline), absent at B (disappeared), or
+            # unreadable at either endpoint: no interval is measurable.
+            unknown_profiles.append(name)
+            continue
+
+        models_a = models_of(entry_a)
+        models_b = models_of(entry_b)
+
+        for model in sorted(set(models_a) | set(models_b)):
+            counters_a = models_a.get(model)
+            counters_b = models_b.get(model)
+            if counters_a is None:
+                # New model under an already-readable profile: A was
+                # readably observed, so B's counters are interval
+                # activity for that model (A could not have missed them).
+                if (all(valid_counter(counters_b.get(key))
+                        for key in COUNTER_KEYS)):
+                    activity.append(activity_entry(name, model, counters_b))
+                else:
+                    unknown_identities.append(f"{name}/{model}")
+                continue
+            if counters_b is None:
+                # Model row gone at B: continuity unknown for identity.
+                unknown_identities.append(f"{name}/{model}")
+                continue
+            deltas = []
+            unknown = False
+            for key in COUNTER_KEYS:
+                value_a = counters_a.get(key)
+                value_b = counters_b.get(key)
+                if not valid_counter(value_a) or not valid_counter(value_b):
+                    unknown = True
+                    break
+                if value_b < value_a:
+                    # Any decrease = continuity unknown for identity.
+                    unknown = True
+                    break
+                deltas.append(int(value_b) - int(value_a))
+            if unknown:
+                unknown_identities.append(f"{name}/{model}")
+                continue
+            if all(delta == 0 for delta in deltas):
+                continue  # unchanged identity: no activity, not unknown
+            entry = {"agent": name, "model": model}
+            for key, delta in zip(COUNTER_KEYS, deltas):
+                entry[DELTA_KEYS[key]] = delta
+            activity.append(entry)
+
+    return (True, activity, unknown_profiles, unknown_identities)
+
+
+def build_interval(obs_a, obs_b):
+    """Build one interval record from two consecutive observations, or
+    None when the pair does not support an interval."""
+    if not validate_observation(obs_a) or not validate_observation(obs_b):
+        return None
+    start = parse_ts(obs_a["observedAt"])
+    end = parse_ts(obs_b["observedAt"])
+    if not end > start:
+        # Duplicate or reversed endpoints: no measurable interval.
+        return None
+
+    record = {
+        "schemaVersion": 1,
+        "startAt": iso(start),
+        "endAt": iso(end),
+    }
+
+    # Session and weekly are evaluated independently.
+    record["codex"] = {
+        "session": codex_delta(obs_a, obs_b, "session"),
+        "weekly": codex_delta(obs_a, obs_b, "weekly"),
+    }
+
+    hermes_known, activity, unknown_profiles, unknown_identities = \
+        hermes_diff(obs_a, obs_b)
+    record["hermesKnown"] = hermes_known
+    record["activity"] = activity
+    record["unknownProfiles"] = unknown_profiles
+    record["unknownIdentities"] = unknown_identities
+
+    codex_ok = (record["codex"]["session"]["status"] == "ok"
+                and record["codex"]["weekly"]["status"] == "ok")
+    codex_all_gap = (record["codex"]["session"]["status"] == "gap"
+                     and record["codex"]["weekly"]["status"] == "gap")
+    hermes_clean = (hermes_known and not unknown_profiles
+                    and not unknown_identities)
+    if codex_ok and hermes_clean:
+        record["status"] = "complete"
+    elif codex_all_gap and not hermes_known:
+        record["status"] = "unknown"
+    else:
+        record["status"] = "partial"
+    return record
+
+
+def build_intervals(observations):
+    """Intervals over consecutive observations (list order). A pair that
+    cannot be measured is skipped without merging across it."""
+    if not isinstance(observations, (list, tuple)):
+        return []
+    intervals = []
+    for first, second in zip(observations, observations[1:]):
+        record = build_interval(first, second)
+        if record is not None:
+            intervals.append(record)
+    return intervals
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Build Agent Fleet interval records from consecutive "
+                    "Phase 3 observations (read-only, pure).",
+    )
+    parser.add_argument("--state", type=Path, default=None,
+                        help="observations.jsonl to read (never modified)")
+    parser.add_argument("--pretty", action="store_true",
+                        help="pretty-print the single JSON document")
+    args = parser.parse_args(argv)
+
+    state = args.state or default_state_path()
+    if not state.is_file():
+        note(f"no observations file: {state}")
+        print(json.dumps({"intervals": []},
+                         indent=2 if args.pretty else None))
+        return 0
+
+    observations = []
+    for line in state.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            observations.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # corrupt lines never block the pure layer
+
+    payload = {"intervals": build_intervals(observations)}
+    if args.pretty:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

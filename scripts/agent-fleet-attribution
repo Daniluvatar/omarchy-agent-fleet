@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Agent Fleet attribution engine (Phase 3, Task 4).
+
+Pure, offline attribution over interval records
+(``agent-fleet-intervals`` output). No UI, no persistence of its own,
+no provider-semantics invention. Reads interval records; emits
+attribution records.
+
+Correctness rules (approved at checkpoint 3):
+
+Per Codex window (session and weekly ARE operated on independently):
+
+- Codex status ``gap`` -> ``{"kind": "gap"}``. No attribution.
+- Codex status ``reset_boundary`` -> ``{"kind": "reset_boundary"}``.
+  No attribution.
+- Codex ``ok`` with delta <= 0 -> ``{"kind": "no_allowance_delta"}``.
+  Nothing is allocated; NO zero-provider-cost inference is made or
+  recorded.
+- Codex ``ok`` with positive delta:
+  - **Partial Hermes observability blocks allocation.** If
+    ``hermesKnown`` is false, OR ``unknownProfiles`` is non-empty, OR
+    ``unknownIdentities`` is non-empty, the ENTIRE positive allowance
+    delta is emitted as
+    ``{"kind": "unattributed", "reason":
+       "incomplete_hermes_observability"}``. This prevents "only
+    observed identity" being mistaken for "only identity that actually
+    used Codex".
+  - Complete observability + zero Hermes activity entries ->
+    ``{"kind": "unattributed", "reason": "no_hermes_activity"}``.
+  - Complete observability + zero-call activity only (tokens moved,
+    calls did not) -> ``{"kind": "unattributed",
+    "reason": "no_callable_activity"}`` (nothing weightable).
+  - Complete observability + exactly ONE active identity
+    (``deltaCalls > 0``) -> ``{"kind": "observed_single", ...}``:
+    the full observed delta is allocated to that identity. This is
+    observational correlation, NOT provider billing truth.
+  - Complete observability + MULTIPLE active identities ->
+    ``{"kind": "estimated_shared", ...}``: allocated by ``deltaCalls``
+    only: ``delta * calls_i / sum(calls)``. Zero-call rows are ignored
+    for weighting. Input/output/cache token deltas are NEVER used as
+    cost weights. No model multipliers.
+
+- Allocations are full-precision floats (no internal display rounding);
+  they sum back to the observed delta within deterministic floating
+  tolerance.
+- Identity is ALWAYS ``agent + model``.
+- No numeric confidence scores of any kind.
+
+Record shape per window:
+
+    {"kind": "gap" | "reset_boundary" | "no_allowance_delta"
+              | "unattributed" | "observed_single" | "estimated_shared"
+              | "invalid",
+     "reason": "no_hermes_activity" | "incomplete_hermes_observability"
+               | "no_callable_activity"      (unattributed only),
+     "allocations": [   -- observed_single / estimated_shared only
+        {"agent": "<pid>", "model": "<model>",
+         "allocatedPoints": <full-precision float>}
+    ])}
+
+Offline read-only CLI (stdout contract: EXACTLY one JSON document;
+diagnostics to stderr):
+
+    agent-fleet-attribution --state PATH [--pretty]
+
+prints ``{"attributions": [...]}`` for the observations file, chaining
+the pure interval layer over consecutive observations. Read-only.
+"""
+
+import argparse
+import json
+import sys
+
+SESSION = "session"
+WEEKLY = "weekly"
+
+
+def note(message):
+    print(f"agent-fleet-attribution: {message}", file=sys.stderr)
+
+
+def hermes_complete(interval):
+    """Hermes observability for the interval is complete only when the
+    section was known at both endpoints and nothing is unknown/baselined
+    at profile or identity level."""
+    return (bool(interval.get("hermesKnown"))
+            and not interval.get("unknownProfiles")
+            and not interval.get("unknownIdentities"))
+
+
+def active_identities(activity):
+    """Active identities: entries with deltaCalls > 0, as (agent, model,
+    deltaCalls). Zero-call rows (tokens moved, calls did not) are
+    present for diagnostics but NEVER weightable."""
+    active = []
+    for entry in activity or []:
+        if not isinstance(entry, dict):
+            continue
+        agent = entry.get("agent")
+        model = entry.get("model")
+        calls = entry.get("deltaCalls")
+        if (not isinstance(agent, str) or not isinstance(model, str)):
+            continue
+        if (isinstance(calls, bool) or not isinstance(calls, (int, float))
+                or calls <= 0):
+            continue
+        active.append((agent, model, calls))
+    return active
+
+
+def unattributed(reason):
+    return {"kind": "unattributed", "reason": reason}
+
+
+def window_attribution(interval, window_name):
+    window = (interval.get("codex") or {}).get(window_name)
+    if not isinstance(window, dict):
+        return {"kind": "invalid"}
+    status = window.get("status")
+    delta = window.get("deltaPoints")
+
+    if status == "gap":
+        return {"kind": "gap"}
+    if status == "reset_boundary":
+        return {"kind": "reset_boundary"}
+    if status != "ok" or (isinstance(delta, bool)
+                          or not isinstance(delta, (int, float))):
+        return {"kind": "invalid"}
+    if delta <= 0:
+        # Nothing to allocate; no zero-provider-cost inference is made.
+        return {"kind": "no_allowance_delta"}
+
+    activity = interval.get("activity")
+    if not hermes_complete(interval):
+        # Partial observability: the whole positive delta stays
+        # unattributed. Known entries gain nothing here.
+        return unattributed("incomplete_hermes_observability")
+    if not activity:
+        return unattributed("no_hermes_activity")
+
+    active = active_identities(activity)
+    if not active:
+        return unattributed("no_callable_activity")
+
+    if len(active) == 1:
+        agent, model, _calls = active[0]
+        return {
+            "kind": "observed_single",
+            "allocations": [{"agent": agent, "model": model,
+                             "allocatedPoints": delta}],
+        }
+
+    total_calls = sum(calls for _a, _m, calls in active)
+    allocations = [
+        {"agent": agent, "model": model,
+         "allocatedPoints": delta * calls / total_calls}
+        for agent, model, calls in sorted(active)
+    ]
+    return {"kind": "estimated_shared", "allocations": allocations}
+
+
+def attribute(interval):
+    """Attribution record for one interval record (pure)."""
+    if not isinstance(interval, dict):
+        return {"schemaVersion": 1, "codex": {"session": {"kind": "invalid"},
+                                              "weekly": {"kind": "invalid"}}}
+    return {
+        "schemaVersion": 1,
+        "startAt": interval.get("startAt"),
+        "endAt": interval.get("endAt"),
+        "codex": {
+            SESSION: window_attribution(interval, SESSION),
+            WEEKLY: window_attribution(interval, WEEKLY),
+        },
+    }
+
+
+def attribute_intervals(intervals):
+    if not isinstance(intervals, (list, tuple)):
+        return []
+    return [attribute(interval) for interval in intervals]
+
+
+def main(argv=None):
+    import os
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        description="Attribute Codex allowance deltas to agent+model "
+                    "identities from Phase 3 intervals (pure, read-only).",
+    )
+    parser.add_argument("--state", type=Path, default=None,
+                        help="observations.jsonl to read (never modified)")
+    parser.add_argument("--pretty", action="store_true")
+    args = parser.parse_args(argv)
+
+    xdg = os.path.abspath(os.environ.get("XDG_STATE_HOME", "").strip())
+    if not xdg:
+        xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+    default = Path(xdg) / "omarchy" / "agent-fleet" / "observations.jsonl"
+    state = args.state or default
+
+    intervals_module = None
+    scripts_dir = Path(__file__).resolve().parent
+    if state.is_file() and (scripts_dir / "agent-fleet-intervals").is_file():
+        loader = SourceFileLoader(
+            "af_intervals_attribution_cli",
+            str(scripts_dir / "agent-fleet-intervals"))
+        spec = spec_from_loader(loader.name, loader)
+        intervals_module = module_from_spec(spec)
+        loader.exec_module(intervals_module)
+
+    observations = []
+    if state.is_file():
+        for line in state.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                observations.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    if intervals_module is None:
+        intervals = []
+    else:
+        intervals = intervals_module.build_intervals(observations)
+    payload = {"attributions": attribute_intervals(intervals)}
+    if args.pretty:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

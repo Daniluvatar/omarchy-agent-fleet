@@ -33,6 +33,16 @@ Item {
   property bool available: false
   property string tier: ""
 
+  // Stale display state (UI continuity only — never an attribution source).
+  // When a refresh settles with Codex upstream intermittently unavailable but
+  // a good record exists, the last-good record stays visible and is marked
+  // stale: the panel says when it was last confirmed. The snapshot store
+  // never reads this record; it collects fresh via its own collector run,
+  // where a failed refresh lands as codex.available=false and a gap.
+  property bool stale: false
+  property var lastGoodMs: 0      // when the displayed record was last confirmed
+  property var staleSinceMs: 0    // when it became unconfirmed
+
   // The two meter windows, in the order the panel shows them. A null percent
   // is the panel's "—" — the collector emitted an available record but left
   // a window unmeasured.
@@ -73,6 +83,28 @@ Item {
 
   readonly property string state: codex.dataState
 
+  // Emitted exactly once per settle path, so the panel can observe "this
+  // collector finished one refresh" without polling.
+  signal settled()
+
+  // Common tail of every settle path. Idempotent; the panel's reaction is
+  // itself idempotent, so the onExited safety net double-settling is harmless.
+  function _finishSettle() {
+    watchdog.stop()
+    codex.refreshing = false
+    codex.settled()
+  }
+
+  // A refresh settled without fresh data while a good record is displayed:
+  // keep the record, flag it stale.
+  function markStaleIfRecord() {
+    if (codex.record && codex.record.available === true) {
+      codex.stale = true
+      codex.staleSinceMs = Date.now()
+      codex.dataState = "ready"
+    }
+  }
+
   function refresh() {
     codex.refreshing = true
     watchdog.running = true
@@ -89,7 +121,10 @@ Item {
   function settleUnavailable() {
     if (codex.state === "loading")
       codex.dataState = "unavailable"
-    codex.refreshing = false
+    codex.markStaleIfRecord()
+    if (codex.state === "unavailable")
+      codex.stale = false
+    codex._finishSettle()
   }
 
   function noteResult(stdoutText) {
@@ -97,20 +132,42 @@ Item {
     try {
       var parsed = JSON.parse(body)
       if (!parsed || parsed.schemaVersion !== 1 || parsed.provider !== "codex") {
-        codex.settleUnavailable()
+        codex.markStaleIfRecord()
+        codex._finishSettle()
         return
       }
-      codex.record = parsed
-      codex.available = parsed.available === true
-      codex.tier = (parsed.available && parsed.tier) ? String(parsed.tier) : ""
-      codex.fetchedAtMs = Date.now()
-      codex.dataState = codex.available ? "ready" : "unavailable"
+      if (parsed.available === true) {
+        // Fresh, confirmed: replaces whatever was displayed and clears stale.
+        codex.record = parsed
+        codex.available = true
+        codex.tier = (parsed.tier) ? String(parsed.tier) : ""
+        codex.fetchedAtMs = Date.now()
+        codex.lastGoodMs = codex.fetchedAtMs
+        codex.stale = false
+        codex.staleSinceMs = 0
+        codex.dataState = "ready"
+      } else if (codex.record && codex.record.available === true) {
+        // Intermittent upstream failure with a previously confirmed record:
+        // retain the last-good value and mark it stale (UI continuity). This
+        // value is NOT copied into the snapshot store as if it were fresh.
+        codex.available = true
+        codex.stale = true
+        codex.staleSinceMs = Date.now()
+        codex.dataState = "ready"
+      } else {
+        // Never had a good record: keep the existing unavailable state.
+        codex.record = parsed
+        codex.available = false
+        codex.tier = ""
+        codex.stale = false
+        codex.staleSinceMs = 0
+        codex.dataState = "unavailable"
+      }
     } catch (err) {
       // Malformed output: the last good record (or nothing) stays the truth.
-      codex.settleUnavailable()
+      codex.markStaleIfRecord()
     }
-    watchdog.stop()
-    codex.refreshing = false
+    codex._finishSettle()
   }
 
   Process {

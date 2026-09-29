@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Agent Fleet observation snapshot (Phase 3, Task 2).
+
+Combines the existing Agent Fleet Codex and Hermes collectors into ONE
+normalized observation and appends it to a small local JSONL store.
+This script captures checkpoints only -- it does NOT compute intervals,
+attribution, weighting or any UI-facing values (Phase 3 Tasks 3-7).
+
+Storage location:
+
+    $XDG_STATE_HOME/omarchy/agent-fleet/observations.jsonl
+    (fallback: ~/.local/state/omarchy/agent-fleet/observations.jsonl)
+
+Observation semantics (docs/phase-3-attribution-notes.md):
+
+- A line is a **cumulative checkpoint**, not an interval record. Hermes
+  counters are the *un-windowed* cumulative ``openai-codex`` totals per
+  profile + model (Task 1 decision: never the Phase 2 7-day filtered
+  sums, never ``agent.log``).
+- The very first snapshot is a baseline only. It represents no
+  attributable interval and its lifetime counters must never be
+  interpreted as new activity. Only TASK 3 differences between two valid
+  consecutive observations may become interval activity.
+- The Hermes section distinguishes three profile states explicitly
+  (checkpoint-2A contract), so an unreadable profile can never
+  *disappear* from one snapshot and *reappear* later with lifetime
+  counters that could be mistaken for interval activity:
+    - readable, zero/no matching Codex activity:
+      ``{"available": true,  "models": {}}``
+    - did not exist / not yet observed: **absent from the map entirely**
+    - existed but was unreadable during this snapshot:
+      ``{"available": false, "models": {}}``
+  Section-level ``available`` means "the profiles root was scanned
+  successfully"; per-profile ``available`` records the per-profile gap.
+  No raw error text for an unreadable profile is persisted.
+- Codex and Hermes availability are independent: each section carries its
+  own ``available`` flag. An observation with one side missing is still
+  written (a gap on one side must not discard the other). If BOTH sides
+  are unavailable, nothing is written -- there is no content to persist.
+
+Persistence guarantees for this MVP store:
+
+- Append-only JSONL, one compact JSON object per line.
+- Crash-safe write: pruned content + new line go to a temp file in the
+  same directory (fsync'd), then atomically ``os.replace``d over the
+  store. A crash mid-write leaves the previous store intact.
+- Retention: lines whose ``observedAt`` is older than the retention
+  window (default 14 days) are pruned on write. Unparseable lines are
+  dropped (tolerated, never fatal).
+- Near-duplicate suppression: no new observation is taken while less
+  than the minimum spacing (default 60 s) has elapsed since the newest
+  valid observation.
+- State directory is created 0700 and the store file 0600.
+
+Never persisted: prompt/response content, session ids, task buckets,
+display names, credentials, raw log lines, raw Codex upstream text or
+error messages. Codex error *codes* (fixed strings) only.
+
+Development hooks used by the tests, not by the panel:
+
+    --state PATH        write to this store file instead of the default
+    --hermes-root PATH  scan this profiles directory (default ~/.hermes/profiles)
+    --codex-input P|-   feed the Codex collector a fixture record
+    --codex-command C   override the upstream Codex command
+    --now EPOCH         pin "now" (deterministic observedAt/spacing/pruning)
+    --min-spacing SEC   duplicate-suppression window (default 60)
+    --retention-days N  retention window (default 14)
+"""
+
+import argparse
+import json
+import math
+import os
+import stat
+import sys
+import time
+from datetime import datetime
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+SCRIPTS_DIR = Path(__file__).resolve().parent
+DEFAULT_MIN_SPACING_SEC = 60.0
+DEFAULT_RETENTION_DAYS = 14.0
+COUNTER_KEYS = ("calls", "inputTokens", "outputTokens",
+                "cacheReadTokens", "cacheWriteTokens")
+
+CODE_SNAPSHOT_FAILED = "SNAPSHOT_FAILED"
+SKIP_DUPLICATE = "duplicate_window"
+SKIP_EMPTY = "empty_observation"
+
+
+def note(message):
+    print(f"agent-fleet-snapshot: {message}", file=sys.stderr)
+
+
+def _load_module(alias, filename):
+    loader = SourceFileLoader(alias, str(SCRIPTS_DIR / filename))
+    mod = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def default_state_path():
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        base = Path(xdg).expanduser()
+        if base.is_absolute():
+            return (base / "omarchy" / "agent-fleet" / "observations.jsonl")
+    return (Path.home() / ".local" / "state" / "omarchy" / "agent-fleet"
+            / "observations.jsonl")
+
+
+def iso_local(epoch_seconds):
+    try:
+        return (datetime.fromtimestamp(epoch_seconds).astimezone()
+                .isoformat(timespec="seconds"))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
+# --- Codex checkpoint -------------------------------------------------
+
+def codex_checkpoint(codex_mod, codex_args):
+    args = argparse.Namespace(
+        input=codex_args.get("input"),
+        command=codex_args.get("command"),
+        timeout=codex_args.get("timeout"),
+    )
+    record = codex_mod.collect(args)
+    limits = record.get("limits") if isinstance(record, dict) else None
+    limits = limits if isinstance(limits, dict) else {}
+
+    def window(slot):
+        entry = limits.get(slot)
+        if not isinstance(entry, dict):
+            return None
+        percent = entry.get("usedPercent")
+        try:
+            percent = round(float(percent), 1)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(percent) or percent < 0:
+            return None
+        resets_at = entry.get("resetsAt")
+        return {"usedPercent": percent,
+                "resetsAt": resets_at if isinstance(resets_at, str) else None}
+
+    section = {
+        "available": False,
+        "tier": None,
+        "session": None,
+        "weekly": None,
+        "error": None,
+    }
+    if record.get("available"):
+        section["available"] = True
+        tier = record.get("tier")
+        section["tier"] = tier if isinstance(tier, str) and tier else None
+        section["session"] = window("session")
+        section["weekly"] = window("weekly")
+    else:
+        error = record.get("error")
+        if isinstance(error, dict) and isinstance(error.get("code"), str):
+            section["error"] = error["code"]
+    return section
+
+
+# --- Hermes checkpoint ------------------------------------------------
+
+def hermes_checkpoint(hermes_mod, hermes_root):
+    root = Path(hermes_root)
+    if not root.is_dir():
+        note(f"profiles root not found: {root.name}/")
+        return {"available": False, "profiles": {}}
+
+    profiles = {}
+    for profile_dir in sorted(root.iterdir(), key=lambda p: p.name):
+        if not profile_dir.is_dir() or profile_dir.name.startswith("."):
+            continue
+        records = hermes_mod.load_profile(profile_dir)
+        if records is None:
+            # Existed but unreadable during this snapshot. Keep the
+            # identity with an explicit flag instead of dropping it:
+            # dropping would let the same profile reappear later with
+            # lifetime counters that a differ might misread as activity.
+            # (No error text is persisted, by design.)
+            profiles[profile_dir.name] = {"available": False, "models": {}}
+            continue
+        profiles[profile_dir.name] = {
+            "available": True,
+            "models": cumulative_models(records),
+        }
+    return {"available": True, "profiles": profiles}
+
+
+def cumulative_models(records):
+    models = {}
+    for record in records:
+        entry = models.setdefault(record["model"],
+                                  {key: 0 for key in COUNTER_KEYS})
+        for key in COUNTER_KEYS:
+            entry[key] += record[key]
+    return models
+
+
+def build_observation(now_epoch, codex_section, hermes_section):
+    observed_at = iso_local(now_epoch)
+    if observed_at is None:
+        raise ValueError("cannot render observedAt")
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "observedAt": observed_at,
+        "codex": codex_section,
+        "hermes": hermes_section,
+    }
+
+
+# --- Store ------------------------------------------------------------
+
+def parse_observed_at(line):
+    """Epoch seconds of a valid line's observedAt, else None.
+
+    Naive (offset-less) timestamps are rejected: they would be compared
+    against local time with the wrong offset.
+    """
+    try:
+        obj = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    raw = obj.get("observedAt")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def read_existing_lines(state_path):
+    if not state_path.is_file():
+        return []
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        note(f"cannot read existing store: {exc.strerror or exc}")
+        return []
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def newest_observed_at(lines):
+    newest = None
+    for line in lines:
+        stamp = parse_observed_at(line)
+        if stamp is not None and (newest is None or stamp > newest):
+            newest = stamp
+    return newest
+
+
+def prune(lines, now_epoch, retention_days):
+    cutoff = now_epoch - float(retention_days) * 86400.0
+    kept = []
+    for line in lines:
+        stamp = parse_observed_at(line)
+        if stamp is not None and stamp >= cutoff:
+            kept.append(line)
+    return kept
+
+
+def atomic_write(path, content):
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, stat.S_IRWXU)  # 0700: user-only state
+    except OSError as exc:
+        note(f"cannot set state directory permissions: {exc.strerror or exc}")
+    tmp_path = directory / f".observations.jsonl.tmp-{os.getpid()}"
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    dir_fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def run(state_path, now_epoch, min_spacing, retention_days,
+        codex_section, hermes_section):
+    state_path = Path(state_path)
+    existing = read_existing_lines(state_path)
+
+    last = newest_observed_at(existing)
+    if last is not None and (now_epoch - last) < float(min_spacing):
+        note("within minimum spacing of the newest observation; skipping")
+        return {
+            "status": "skipped",
+            "statePath": str(state_path),
+            "skippedBecause": SKIP_DUPLICATE,
+            "observed": False,
+        }
+
+    if not codex_section["available"] and not hermes_section["available"]:
+        note("both sources unavailable; nothing to persist")
+        return {
+            "status": "skipped",
+            "statePath": str(state_path),
+            "skippedBecause": SKIP_EMPTY,
+            "observed": False,
+        }
+
+    try:
+        new_line = json.dumps(
+            build_observation(now_epoch, codex_section, hermes_section),
+            separators=(",", ":"),
+        )
+    except ValueError as exc:
+        note(f"cannot build observation: {exc}")
+        return {
+            "status": "failed",
+            "statePath": str(state_path),
+            "skippedBecause": None,
+            "error": CODE_SNAPSHOT_FAILED,
+        }
+
+    kept = prune(existing, now_epoch, retention_days)
+    try:
+        atomic_write(state_path, "".join(line + "\n" for line in kept)
+                     + new_line + "\n")
+    except OSError as exc:
+        note(f"cannot write store: {exc.strerror or exc}")
+        return {
+            "status": "failed",
+            "statePath": str(state_path),
+            "skippedBecause": None,
+            "error": CODE_SNAPSHOT_FAILED,
+        }
+
+    return {
+        "status": "written",
+        "statePath": str(state_path),
+        "skippedBecause": None,
+        "pruned": len(existing) - len(kept),
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Capture one Agent Fleet observation checkpoint.")
+    parser.add_argument("--state", default=None,
+                        help="store file (default: XDG state home or "
+                             "~/.local/state/omarchy/agent-fleet/observations.jsonl)")
+    parser.add_argument("--hermes-root", default=None,
+                        help="Hermes profiles directory (default: ~/.hermes/profiles)")
+    parser.add_argument("--codex-input", default=None,
+                        help="feed the Codex collector this record (path or -)")
+    parser.add_argument("--codex-command", default=None,
+                        help="override the upstream Codex command")
+    parser.add_argument("--codex-timeout", type=float, default=20.0,
+                        help="upstream Codex timeout in seconds")
+    parser.add_argument("--now", type=float, default=None,
+                        help="test hook: fix 'now' to an epoch-seconds value")
+    parser.add_argument("--min-spacing", type=float, default=DEFAULT_MIN_SPACING_SEC,
+                        help=f"minimum seconds between observations (default {DEFAULT_MIN_SPACING_SEC:g})")
+    parser.add_argument("--retention-days", type=float, default=DEFAULT_RETENTION_DAYS,
+                        help=f"observation retention in days (default {DEFAULT_RETENTION_DAYS:g})")
+    args = parser.parse_args(argv)
+
+    state_path = Path(args.state).expanduser() if args.state else default_state_path()
+    now_epoch = args.now if args.now is not None else time.time()
+    hermes_root = args.hermes_root
+
+    codex_mod = _load_module("af_codex", "agent-fleet-codex")
+    hermes_mod = _load_module("af_hermes", "agent-fleet-hermes")
+
+    try:
+        codex_section = codex_checkpoint(
+            codex_mod,
+            {"input": args.codex_input, "command": args.codex_command,
+             "timeout": args.codex_timeout},
+        )
+    except Exception as exc:
+        note(f"codex collector unexpected failure: {type(exc).__name__}")
+        codex_section = {"available": False, "tier": None, "session": None,
+                         "weekly": None, "error": CODE_SNAPSHOT_FAILED}
+
+    if hermes_root is None:
+        hermes_root = str(hermes_mod.DEFAULT_ROOT)
+    try:
+        hermes_section = hermes_checkpoint(hermes_mod, hermes_root)
+    except Exception as exc:
+        note(f"hermes collection unexpected failure: {type(exc).__name__}")
+        hermes_section = {"available": False, "profiles": {}}
+
+    try:
+        result = run(state_path, now_epoch, args.min_spacing,
+                     args.retention_days, codex_section, hermes_section)
+    except Exception as exc:
+        note(f"unexpected failure: {type(exc).__name__}")
+        result = {
+            "status": "failed",
+            "statePath": str(state_path),
+            "skippedBecause": None,
+            "error": CODE_SNAPSHOT_FAILED,
+        }
+
+    print(json.dumps(result, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

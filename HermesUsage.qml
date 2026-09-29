@@ -148,6 +148,10 @@ Item {
     return String(n)
   }
 
+  // Emitted once per settle path so the panel can observe "this collector
+  // finished one refresh" without polling.
+  signal settled()
+
   function refresh() {
     hermes.refreshing = true
     watchdog.running = true
@@ -181,6 +185,7 @@ Item {
     if (hermes.dataState === "loading")
       hermes.dataState = "unavailable"
     hermes.refreshing = false
+    hermes.settled()
   }
 
   function noteResult(stdoutText) {
@@ -201,6 +206,7 @@ Item {
     }
     watchdog.stop()
     hermes.refreshing = false
+    hermes.settled()
   }
 
   Process {
