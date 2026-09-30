@@ -85,6 +85,18 @@ Panel {
   // the fleet label without a number. The bar's urgent tint (session window
   // at or over 80 %) is the at-a-glance signal and works either way.
   readonly property bool showPercentInBar: setting("showPercentInBar", true) === true
+  // Phase 5 (Task 7): which window's live attribution the panel OPENS on —
+  // "weekly" (existing default) or "session" (5-hour). Presentation-only:
+  // it only seeds the [ Weekly ] [ 5-hour ] selector's initial selection;
+  // AttributionUsage still fetches and caches BOTH windows every settle,
+  // switching is display-only, and the value changes no data or math.
+  readonly property string defaultAttributionWindow:
+    setting("defaultAttributionWindow", "weekly") === "session" ? "session" : "weekly"
+  // Phase 5 (Task 7): whether the Recent Segments section (Task 6) shows.
+  // Presentation-only: hiding it renders nothing and stops further
+  // HistoryUsage refreshes (enabled=false); the section is strictly
+  // read-only either way — the segments store is never written by it.
+  readonly property bool showRecentSegments: setting("showRecentSegments", true) === true
 
   // ------------------------------------------------------------- data
   readonly property var codexUsage: CodexUsage {}
@@ -112,12 +124,28 @@ Panel {
   // exposes.
   readonly property var attributionUsage: AttributionUsage { window: root.attributionWindow }
 
+  // Phase 5 (Task 6): "Recent Segments" — its own strictly read-only
+  // data source (HistoryUsage) over segments.jsonl: the CLI's --list
+  // mode renders the already-persisted completed segments (both windows
+  // coexist, newest first), so this source can never append, prune,
+  // rewrite the store, or even read observations.jsonl. It is NOT
+  // filtered by the window selector — the selector only chooses the
+  // live attribution summary above.
+  readonly property var historyUsage: HistoryUsage {}
   // [ Weekly ] [ 5-hour ] selector state (Phase 4 session / 5-hour
   // attribution view). Pure display state: changing it re-renders the
   // corresponding already-computed cached summary. It never refreshes a
   // collector, never takes a snapshot, and never writes observations.jsonl
-  // or segments.jsonl. Weekly stays the default.
-  property string attributionWindow: "weekly"
+  // or segments.jsonl. The initial value comes from the Task 7 manifest
+  // setting defaultAttributionWindow (weekly by default, so existing
+  // behavior is unchanged); the first selector click breaks the binding
+  // and the choice remains per-shell session state, exactly as before.
+  property string attributionWindow: root.defaultAttributionWindow
+
+  // Phase 5 (Task 7): apply the showRecentSegments manifest setting to the
+  // HistoryUsage data source (default: true = active). Done at completion:
+  // when off, the source stays inert for all later refresh waves.
+  Component.onCompleted: root.historyUsage.enabled = root.showRecentSegments
 
   // Phase 4 (agent / model expand-collapse). In-memory ONLY: the list of
   // stable agent IDs currently expanded, collapsed by default (empty). The
@@ -272,6 +300,11 @@ Panel {
     // snapshot or refresh a collector, so no recursion, no extra capture.
     if (root.attributionUsage && root.attributionUsage.refresh)
       root.attributionUsage.refresh()
+    // Recent Segments re-renders whatever the store holds now (a segment
+    // may have been just persisted for a completed window). Read-only:
+    // the list path never writes, prunes, or touches observations.jsonl.
+    if (root.historyUsage && root.historyUsage.refresh)
+      root.historyUsage.refresh()
   }
 
   Process {
@@ -679,6 +712,19 @@ Panel {
               font.pixelSize: Style.font.caption
             }
 
+            // Phase 5 (Task 7): expand/collapse discoverability — one
+            // faint hint line, shown only while there is an agent to
+            // expand. No behavior or state change beyond rendering.
+            Text {
+              visible: root.attributionUsage.hasAgentRows
+              width: parent.width
+              text: "Click an agent to expand or collapse its models"
+              color: root.faint
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
             // Empty / waiting states. Deliberately unadorned: no zeros are
             // rendered as if they were evidence before data exists.
             Text {
@@ -843,6 +889,81 @@ Panel {
                 opacity: 0.8
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          PanelSeparator { width: parent.width; visible: root.showRecentSegments }
+
+          // Recent Segments (Phase 5, Task 6; Task 7 adds the
+          // showRecentSegments manifest setting to hide it): the completed
+          // attribution segments already in segments.jsonl — both windows
+          // coexisting, newest first, max 5 compact rows. Render-only: every
+          // value (window label, persisted range, observed, coverage,
+          // unattributed) comes from HistoryUsage, which reads the store
+          // through the CLI's strict read-only --list mode. Opening,
+          // closing, or scrolling this section issues no other commands,
+          // never creates a snapshot, and never touches observations.jsonl
+          // or the store's bytes. The [ Weekly ] [ 5-hour ] selector above
+          // does NOT filter this list. Empty store is a normal state, not
+          // an error. Hidden when showRecentSegments is false (with the
+          // separator above).
+          Column {
+            visible: root.showRecentSegments
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "Recent Segments"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: root.historyUsage.empty
+              width: parent.width
+              text: root.historyUsage.emptyText
+              color: root.dim
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              visible: !root.historyUsage.empty
+              width: parent.width
+              spacing: Style.space(6)
+              Repeater {
+                model: root.historyUsage.rows
+                delegate: Column {
+                  width: parent.width
+                  spacing: Style.space(1)
+                  Row {
+                    spacing: Style.space(6)
+                    Text {
+                      text: modelData.windowLabel
+                      color: root.foreground
+                      opacity: 0.9
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      text: modelData.range
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  Text {
+                    width: parent.width
+                    text: "    " + modelData.line
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
               }
             }
           }

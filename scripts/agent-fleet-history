@@ -61,6 +61,19 @@ stderr; the observations store is read-only and never modified):
 cutoff so retries and tests are deterministic. Retention pruning is
 write-time only: the store is never touched without a scan completing.
 
+Read-only listing (Phase 5, Task 6 — Recent Segments): the ``--list``
+mode renders the ALREADY-PERSISTED segments, newest first, and exits.
+It is strictly separated from the persistence path: it never loads or
+scans the observations store, never prunes, never re-derives anything,
+and never touches the segments store's bytes. Malformed lines are
+ignored; a missing store is a normal empty result, not an error.
+
+    agent-fleet-history --list [--segments PATH]
+
+    {"records": [...persisted records, newest first...],
+     "segmentsPath": "...", "total": N}
+
+
     TZ=America/Guayaquil python3 -m unittest discover -s tests -p 'test_*.py' -v
 """
 
@@ -253,6 +266,59 @@ def num_from(value, default=0.0):
     return float(value)
 
 
+# --- Read-only listing (Phase 5, Task 6) ---------------------------------
+
+def list_segments(segments_path):
+    """Persisted segments, newest first, as display metadata (Phase 5,
+    Task 6). Strictly read-only and strictly separated from the
+    persistence path: no observations store is loaded or scanned, no
+    retention cutoff is applied (that is write-time policy), nothing is
+    re-derived, and the segments store is opened for reading only —
+    rendering history can never prune, append, or rewrite it.
+
+    A record counts as listable when it passes the SAME validity checks
+    the write path uses to keep a line (``record_key`` plus a parseable
+    ``endedAt``) and carries the display fields (``startedAt`` present,
+    ``observedPoints`` numeric). Anything else — malformed JSON, wrong
+    shape, missing fields — is ignored. A missing store is a normal
+    empty result."""
+    dated = []
+    for line in load_history_lines(segments_path):
+        try:
+            obj = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(obj, dict) or record_key(obj) is None:
+            continue
+        if not isinstance(obj["resetsAt"], str) or not obj["resetsAt"].strip():
+            continue  # blank identity: the write path never persists this;
+                      # never display it either
+        if (not isinstance(obj.get("startedAt"), str) or
+                not obj["startedAt"].strip()):
+            continue
+        stamp = ended_at_stamp(obj)
+        if stamp is None:
+            continue
+        observed = obj.get("observedPoints")
+        if isinstance(observed, bool) or not isinstance(observed,
+                                                         (int, float)):
+            continue
+        if (not isinstance(obj.get("attributedPoints"), (int, float)) or
+                isinstance(obj.get("attributedPoints"), bool) or
+                not isinstance(obj.get("unattributedPoints"), (int, float)) or
+                isinstance(obj.get("unattributedPoints"), bool)):
+            continue
+        dated.append((stamp, obj))
+    # Newest first; stable on ties (original file order preserved).
+    dated.sort(key=lambda pair: -pair[0])
+    listed = [obj for _stamp, obj in dated]
+    return {
+        "records": listed,
+        "segmentsPath": str(Path(segments_path)),
+        "total": len(listed),
+    }
+
+
 # --- Write side (segments store) ----------------------------------------
 
 def load_history_lines(segments_path):
@@ -406,7 +472,20 @@ def main(argv=None):
                         default=DEFAULT_RETENTION_DAYS,
                         help="history retention in days "
                              "(default: %(default)s)")
+    parser.add_argument("--list", action="store_true",
+                        help="list the already-persisted segments, "
+                             "newest first, and exit — strictly "
+                             "read-only: never scans the observations "
+                             "store, never prunes, and never writes")
     args = parser.parse_args(argv)
+
+    if args.list:
+        # Read-only listing: the persistence path is never entered
+        # (no scan, no write, no retention, no store modification).
+        segments = args.segments or default_path("segments.jsonl")
+        result = list_segments(segments)
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        return 0
 
     state = args.state or default_path("observations.jsonl")
     segments = args.segments or default_path("segments.jsonl")

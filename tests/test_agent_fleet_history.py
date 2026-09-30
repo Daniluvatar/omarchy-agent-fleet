@@ -543,5 +543,158 @@ class TestContractAndDeterminism(HistoryTestBase):
                                        ("weekly", "W1")})
 
 
+class TestListMode(HistoryTestBase):
+    """Phase 5 Task 6: the read-only ``--list`` mode that feeds the panel's
+    Recent Segments section. The contract under test: newest-first order,
+    both windows coexisting, persisted fidelity, malformed lines ignored,
+    strictly read-only behavior, and a single normalized JSON document on
+    stdout. The command here NEVER passes ``--state`` — the list mode must
+    not need or touch the observations store."""
+
+    def run_list(self, segments=None, extra=None):
+        cmd = [sys.executable, str(HISTORY), "--list",
+               "--segments", str(segments or self.segments)]
+        cmd += extra or []
+        return subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+
+    def payload(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def row(self, **overrides):
+        base = {
+            "schemaVersion": 1,
+            "window": "weekly",
+            "resetsAt": "W1",
+            "startedAt": "2026-09-22T00:00:00-05:00",
+            "endedAt": "2026-09-29T00:00:00-05:00",
+            "observedPoints": 42.0,
+            "attributedPoints": 35.0,
+            "unattributedPoints": 7.0,
+            "coveragePercent": 83.33333333333334,
+            "agents": [],
+            "unattributed": {
+                "noHermesActivityPoints": 7.0,
+                "incompleteHermesObservabilityPoints": 0.0,
+                "noCallableActivityPoints": 0.0},
+        }
+        base.update(overrides)
+        return base
+
+    def write_store(self, rows):
+        self.segments.write_text(
+            "".join(json.dumps(r) + "\n" if isinstance(r, dict)
+                    else r + "\n" for r in rows),
+            encoding="utf-8")
+
+    def test_missing_store_is_normal_empty(self):
+        target = self.tmp / "elsewhere" / "segments.jsonl"
+        proc = self.run_list(segments=target)
+        payload = self.payload(proc)
+        self.assertEqual(payload["records"], [])
+        self.assertEqual(payload["total"], 0)
+        self.assertEqual(payload["segmentsPath"], str(target))
+        # No store — and no parent directory — is created by listing.
+        self.assertFalse(target.exists())
+        self.assertFalse((self.tmp / "elsewhere").exists())
+
+    def test_newest_first_and_windows_coexist(self):
+        oldest_week = self.row(resetsAt="W-OLD",
+                               startedAt="2026-09-15T00:00:00-05:00",
+                               endedAt="2026-09-22T00:00:00-05:00")
+        mid_session = self.row(window="session", resetsAt="S-MID",
+                               startedAt="2026-09-26T08:30:00-05:00",
+                               endedAt="2026-09-26T13:30:00-05:00")
+        newest_week = self.row()  # ended 2026-09-29
+        self.write_store([newest_week, mid_session, oldest_week])
+        payload = self.payload(self.run_list())
+        self.assertEqual(
+            [(r["window"], r["resetsAt"]) for r in payload["records"]],
+            [("weekly", "W1"), ("session", "S-MID"), ("weekly", "W-OLD")])
+        self.assertEqual(payload["total"], 3)
+
+    def test_persisted_fidelity_no_rederivation(self):
+        self.write_store([self.row()])
+        payload = self.payload(self.run_list())
+        self.assertEqual(payload["records"], [self.row()])
+        # High-precision floats are rendered verbatim, full precision.
+        self.assertEqual(
+            payload["records"][0]["coveragePercent"], 83.33333333333334)
+
+    def test_ignores_malformed_and_incomplete_lines(self):
+        good = self.row()
+        no_window = dict(self.row())
+        del no_window["window"]
+        blank_identity = self.row()
+        blank_identity["resetsAt"] = "   "
+        no_started = dict(self.row())
+        del no_started["startedAt"]
+        no_ended = dict(self.row())
+        del no_ended["endedAt"]
+        bad_ended = self.row(endedAt="not-a-time")
+        no_observed = dict(self.row())
+        del no_observed["observedPoints"]
+        self.write_store(["GARBAGE{\"broken\": true",
+                          "[1, 2, 3]",
+                          no_window, blank_identity, no_started, no_ended,
+                          bad_ended, no_observed, good])
+        payload = self.payload(self.run_list())
+        self.assertEqual(payload["records"], [good])
+        self.assertEqual(payload["total"], 1)
+
+    def test_read_only_store_bytes_and_mtime_untouched(self):
+        self.write_store([self.row(),
+                          self.row(window="session", resetsAt="S1",
+                                   startedAt="2026-09-29T08:30:00-05:00",
+                                   endedAt="2026-09-29T13:30:00-05:00",
+                                   observedPoints=18.0,
+                                   attributedPoints=18.0,
+                                   unattributedPoints=0.0,
+                                   coveragePercent=100.0)])
+        before_bytes = self.segments.read_bytes()
+        before_mtime = self.segments.stat().st_mtime_ns
+        self.payload(self.run_list())
+        self.assertEqual(self.segments.read_bytes(), before_bytes)
+        self.assertEqual(self.segments.stat().st_mtime_ns, before_mtime)
+
+    def test_no_observations_store_involved(self):
+        self.write_store([self.row()])
+        # No observations file at all in the temp tree; listing must
+        # succeed without one and must not create one.
+        self.assertFalse(self.state.exists())
+        proc = self.run_list()
+        payload = self.payload(proc)
+        self.assertEqual(payload["total"], 1)
+        self.assertFalse(self.state.exists())
+
+    def test_ties_keep_stable_file_order(self):
+        a = self.row(resetsAt="TIE-A")
+        b = self.row(resetsAt="TIE-B")
+        self.write_store([a, b])
+        payload = self.payload(self.run_list())
+        self.assertEqual([r["resetsAt"] for r in payload["records"]],
+                         ["TIE-A", "TIE-B"])
+
+    def test_retention_is_write_time_only_list_shows_all(self):
+        # A record older than the 90-day retention window is still shown:
+        # retention is a write-time write-policy, never a read-time filter.
+        old = self.existing_line(
+            "weekly", "OLD-100D", float(int(NOW) - 86400 * 100))
+        self.segments.write_text(old + "\n", encoding="utf-8")
+        payload = self.payload(self.run_list())
+        self.assertEqual([r["resetsAt"]
+                          for r in payload["records"]], ["OLD-100D"])
+
+    def test_single_sorted_json_document(self):
+        self.write_store([self.row()])
+        proc = self.run_list()
+        payload = self.payload(proc)
+        self.assertEqual(set(payload), {"records", "segmentsPath", "total"})
+        expected = json.dumps(payload, separators=(",", ":"),
+                              sort_keys=True)
+        self.assertEqual(proc.stdout, expected + "\n")
+        self.assertEqual("", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
