@@ -39,6 +39,24 @@ Coverage means "fraction of observed allowance movement that Agent
 Fleet could attribute". It does NOT mean "percentage of the
 subscription used by Hermes", a confidence score, or billing accuracy.
 
+Markers (Phase 4.5, gap and reset markers): the summary also carries
+`markers` — presentation metadata for the CURRENT window only, in
+chronological order:
+
+- at most one `{"type": "reset_boundary", "at": "..."}` — the newest
+  reset boundary seen in this window (the current segment's starting
+  boundary);
+- one `{"type": "gap", "at": "..."}` per gap interval INSIDE the
+  current segment (a gap before the newest reset belongs to a
+  completed segment and is not a current-segment marker).
+
+`at` is the interval record's real `endAt`, copied verbatim, or null
+when the record carries none — nothing is invented (no timestamps,
+durations, or confidence). Markers never change observedPoints,
+attributedPoints, unattributedPoints, coveragePercent, agents,
+unattributed, segmentStartAt, or segmentEndAt, and the weekly and
+session windows derive markers fully independently.
+
 Identities stay agent + model; an agent's models are never collapsed
 into one. Agent-level totals are provided as an additional rollup.
 Agents and models are emitted in deterministic sorted order.
@@ -123,11 +141,54 @@ def current_segment_intervals(intervals, window):
     return intervals[last_reset + 1:]
 
 
+def _record_end_at(interval):
+    """The interval record's real endAt timestamp, verbatim — or None
+    when the record carries none (never invented)."""
+    ts = interval.get("endAt") if isinstance(interval, dict) else None
+    if isinstance(ts, str) and ts:
+        return ts
+    return None
+
+
+def segment_markers(intervals, window):
+    """Evidence discontinuities of ONE window (Phase 4.5), in
+    chronological order — display metadata only, never consumed by the
+    attribution math:
+
+    - at most one ``reset_boundary`` marker — the newest reset
+      boundary in this window (the current segment's starting
+      boundary);
+    - one ``gap`` marker per gap interval strictly after that boundary
+      (gaps before the newest reset belong to completed segments).
+
+    Each marker copies the interval record's real ``endAt`` (or None).
+    Weekly and session are derived fully independently. Input order is
+    chronological."""
+    if window not in WINDOWS:
+        raise ValueError(f"unknown window: {window!r}")
+    if not isinstance(intervals, (list, tuple)):
+        raise TypeError("intervals must be a list")
+    views = [window_view(interval, window) for interval in intervals]
+    last_reset = max(
+        (i for i, view in enumerate(views)
+         if view["kind"] == "reset_boundary"), default=-1)
+    markers = []
+    if last_reset >= 0:
+        markers.append({"type": "reset_boundary",
+                        "at": _record_end_at(intervals[last_reset])})
+    for i, view in enumerate(views):
+        if i > last_reset and view["kind"] == "gap":
+            markers.append({"type": "gap",
+                            "at": _record_end_at(intervals[i])})
+    return markers
+
+
 def summarize(window, intervals):
     if window not in WINDOWS:
         raise ValueError(f"unknown window: {window!r}")
     if not isinstance(intervals, (list, tuple)):
         raise TypeError("intervals must be a list")
+    all_intervals = intervals
     segments = current_segment_intervals(intervals, window)
     views = [window_view(interval, window) for interval in segments]
     intervals = segments
@@ -231,6 +292,7 @@ def summarize(window, intervals):
             "observedSinglePoints": single_total,
             "estimatedSharedPoints": shared_total,
         },
+        "markers": segment_markers(all_intervals, window),
     }
 
 

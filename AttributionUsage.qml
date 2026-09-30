@@ -98,6 +98,22 @@ Item {
   readonly property var summary: entry.summary
   readonly property bool hasSummary: attribution.summary !== null
 
+  // Phase 4.5 (gap and reset markers): display metadata for the window
+  // being rendered, computed by the aggregate CLI — e.g.
+  //   [ { "type": "reset_boundary", "at": "2026-09-26T12:00:00-05:00" },
+  //     { "type": "gap",            "at": "2026-09-26T13:05:00-05:00" } ]
+  // Strict pass-through: marker types and timestamps come straight from
+  // the CLI output; nothing here is parsed, reinterpreted, or invented
+  // (no durations, no confidence, no fabricated timestamps). The panel
+  // only renders; when the window has no summary (collecting / new_window)
+  // there are no markers.
+  readonly property var markers: {
+    var s = attribution.summary
+    if (s && s.markers && s.markers.length)
+      return s.markers
+    return []
+  }
+
   // ------------------------------------------------------ display helpers
   // "11" for 11.0, "1.5" for 1.5 — at most two decimals, no fabricated
   // precision.

@@ -699,6 +699,27 @@ Panel {
               width: parent.width
               spacing: Style.space(4)
 
+              // Phase 4.5 (gap and reset markers): compact rows for the
+              // evidence discontinuities of THIS window. Marker type and
+              // time come verbatim from the aggregate CLI via
+              // AttributionUsage.markers (pure pass-through) — the
+              // delegate only renders glyphs and the real clock time;
+              // no parsing, no invented timestamps, durations, or
+              // confidence. Markers never alter the numbers below.
+              Repeater {
+                model: root.attributionUsage.markers
+                delegate: Text {
+                  width: parent.width
+                  text: (modelData.type === "reset_boundary"
+                         ? "↻ Reset boundary"
+                         : "○ Evidence gap")
+                       + (modelData.at ? " · " + String(modelData.at).slice(11, 16) : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
               Text {
                 text: root.attributionUsage.observedText
                 color: root.foreground
