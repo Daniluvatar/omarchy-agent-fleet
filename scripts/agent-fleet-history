@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Agent Fleet completed-segment history (Phase 4, Task 2).
+
+Persists **completed** Codex-allowance segments — weekly and session,
+evaluated independently — into a durable, per-provider JSONL store:
+
+- ``$XDG_STATE_HOME/omarchy/agent-fleet/segments.jsonl``
+  (fallback ``~/.local/state/omarchy/agent-fleet/segments.jsonl``),
+  0700 directory / 0600 file, atomic replace.
+
+Scope (approved at checkpoint 4 design, STOP CHECKPOINT 2 gate):
+
+- ONLY completed segments are persisted: a segment is completed by a
+  provider-reported window boundary (the Phase 3 interval layer marks it
+  ``reset_boundary`` for that window). The current in-progress segment
+  is NEVER written, no matter how far it is.
+- Session and weekly are independent: they may complete at different
+  times and produce separate records with the same or different
+  timestamps; they are never mixed or combined.
+- A completed segment without a usable provider ``resetsAt`` identity is
+  skipped (no fallback key — never a local timestamp, never ``unknown``).
+- A completed segment with no observed movement (summarized
+  ``observedPoints <= 0``) is skipped (storage/display policy).
+- Duplicate ``(window, resetsAt)`` pairs are never rewritten:
+  **first-write-wins**. A crash/retry therefore can only re-derive the
+  same skipped pair, not mutate recorded evidence.
+- 90-day retention is applied ON WRITE: history records whose
+  ``endedAt`` is older than the cutoff (or whose endedAt/window/resetsAt
+  cannot be parsed) are dropped when the file is rewritten; this is
+  separate from the 14-day retention of the raw observation store.
+- Existing lines are preserved byte-for-byte (malformed lines dropped);
+  new records are appended as one normalized, key-sorted JSON line each
+  — byte-stable output for identical inputs.
+
+Record shape (fixed key set, full precision, no display rounding):
+
+    {schemaVersion, window, resetsAt,
+     startedAt, endedAt,                        # evidence envelope
+     observedPoints, attributedPoints,
+     unattributedPoints, coveragePercent,
+     agents:   [{agent, models: [{model,
+                                   observedSinglePoints,
+                                   estimatedSharedPoints,
+                                   totalAttributedPoints}],
+                 totalAttributedPoints}],
+     unattributed: {noHermesActivityPoints,
+                    incompleteHermesObservabilityPoints,
+                    noCallableActivityPoints}}
+
+Nothing else. Notably NOT persisted: prompts, responses/messages,
+session IDs, profile tokens or credentials, raw Codex error text, raw
+Hermes records, raw observation/interval records.
+
+Offline CLI (stdout contract: EXACTLY one JSON document; diagnostics to
+stderr; the observations store is read-only and never modified):
+
+    agent-fleet-history [--state PATH] [--segments PATH]
+                        [--now SECONDS] [--retention-days N]
+
+``--now`` (or ``AGENT_FLEET_NOW``) pins the clock for the retention
+cutoff so retries and tests are deterministic. Retention pruning is
+write-time only: the store is never touched without a scan completing.
+
+    TZ=America/Guayaquil python3 -m unittest discover -s tests -p 'test_*.py' -v
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+WINDOWS = ("session", "weekly")
+DEFAULT_RETENTION_DAYS = 90
+
+
+def note(message):
+    print(f"agent-fleet-history: {message}", file=sys.stderr)
+
+
+def load_sibling(name, alias):
+    path = Path(__file__).resolve().parent / name
+    loader = SourceFileLoader(alias, str(path))
+    spec = spec_from_loader(loader.name, loader)
+    module = module_from_spec(spec)
+    sys.modules[alias] = module
+    loader.exec_module(module)
+    return module
+
+
+# Layer boundaries (all read-only, pure):
+observation_mod = load_sibling(
+    "agent-fleet-snapshot", "af_history_snapshot")
+intervals_mod = load_sibling(
+    "agent-fleet-intervals", "af_history_intervals")
+# aggregate internally loads the attribution layer under its own alias.
+aggregate_mod = load_sibling(
+    "agent-fleet-aggregate", "af_history_aggregate")
+
+
+def default_path(filename):
+    xdg = os.path.abspath(os.environ.get("XDG_STATE_HOME", "").strip())
+    if not xdg:
+        xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(xdg) / "omarchy" / "agent-fleet" / filename
+
+
+# --- Read side (observations store; read-only) --------------------------
+
+def load_observations(state_path):
+    """Valid JSON object lines from the observations store, in file
+    order. Invalid lines are skipped (they can never form a usable
+    interval). The store is never modified."""
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return []
+    try:
+        text = state_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        note(f"cannot read observations store: {exc.strerror or exc}")
+        return []
+    observations = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict):
+            observations.append(obj)
+    return observations
+
+
+def build_pairs(observations):
+    """Consecutive-observation interval records as
+    (record, obs_a, obs_b) pairs. Pairs the interval layer cannot
+    measure are skipped without merging across them (its documented
+    semantics)."""
+    pairs = []
+    for obs_a, obs_b in zip(observations, observations[1:]):
+        record = intervals_mod.build_interval(obs_a, obs_b)
+        if record is None:
+            continue
+        pairs.append((record, obs_a, obs_b))
+    return pairs
+
+
+def window_status(record, window):
+    section = record.get("codex")
+    if not isinstance(section, dict):
+        return None
+    inner = section.get(window)
+    return inner.get("status") if isinstance(inner, dict) else None
+
+
+def resets_at(observation, window):
+    """Provider identity of one window at one endpoint
+    (resets_at = usable (usedPercent, resetsAt) or None), or None."""
+    entry = intervals_mod.codex_window(observation, window)
+    return entry[1] if entry is not None else None
+
+
+def completed_runs(pairs, window):
+    """Completed runs for one window, in chronological order, as
+    (run_pairs, closed_identity) tuples. Every run is closed by that
+    window's next `reset_boundary`; the in-progress tail after the last
+    boundary is never included. A closed run's identity is the
+    resetsAt of the last usable endpoint BEFORE the boundary (obs_a of
+    the boundary pair), which the boundary rule guarantees is usable."""
+    boundary_indexes = [
+        i for i, (record, _a, _b) in enumerate(pairs)
+        if window_status(record, window) == "reset_boundary"]
+    runs = []
+    previous = -1
+    for index in boundary_indexes:
+        run = pairs[previous + 1:index]
+        if run:
+            runs.append((run, resets_at(pairs[index][1], window)))
+        previous = index
+    return runs
+
+
+# --- Record construction -------------------------------------------------
+
+def _roundtrip(value):
+    # Isolated, plain-data copy (no references into layer objects).
+    return json.loads(json.dumps(value))
+
+
+def build_record(window, identity, run_pairs):
+    """One compact, deterministic history record for a completed run,
+    or None when the segment must be skipped (blank identity, no
+    observed movement, or no evidence envelope)."""
+    if not isinstance(identity, str) or not identity.strip():
+        return None
+    identity = identity.strip()
+    intervals = [record for record, _a, _b in run_pairs]
+    summary = aggregate_mod.summarize(window, intervals)
+
+    def num(key, default=0.0):
+        value = summary.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        return float(value)
+
+    observed = num("observedPoints", None)
+    if observed is None or observed <= 0:
+        return None  # storage/display policy: no observed movement
+    started = summary.get("segmentStartAt")
+    ended = summary.get("segmentEndAt")
+    if not isinstance(started, str) or not isinstance(ended, str):
+        return None
+
+    coverage = summary.get("coveragePercent")
+    if (isinstance(coverage, bool) or
+            not isinstance(coverage, (int, float))):
+        coverage = None
+    unattributed_shape = {
+        "noHermesActivityPoints": 0.0,
+        "incompleteHermesObservabilityPoints": 0.0,
+        "noCallableActivityPoints": 0.0}
+    raw_unattributed = summary.get("unattributed")
+    if not isinstance(raw_unattributed, dict):
+        raw_unattributed = unattributed_shape
+    unattributed = {field: num_from(raw_unattributed.get(field))
+                    for field in unattributed_shape}
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "window": window,
+        "resetsAt": identity,
+        "startedAt": started,
+        "endedAt": ended,
+        "observedPoints": observed,
+        "attributedPoints": num("attributedPoints"),
+        "unattributedPoints": num("unattributedPoints"),
+        "coveragePercent": float(coverage) if coverage is not None
+        else None,
+        "agents": _roundtrip(summary.get("agents") or []),
+        "unattributed": unattributed,
+    }
+
+
+def num_from(value, default=0.0):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
+# --- Write side (segments store) ----------------------------------------
+
+def load_history_lines(segments_path):
+    segments_path = Path(segments_path)
+    if not segments_path.is_file():
+        return []
+    try:
+        text = segments_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        note(f"cannot read segments store: {exc.strerror or exc}")
+        return []
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def record_key(obj):
+    if not isinstance(obj, dict):
+        return None
+    window = obj.get("window")
+    resets = obj.get("resetsAt")
+    if not isinstance(window, str) or not isinstance(resets, str):
+        return None
+    return (window, resets)
+
+
+def ended_at_stamp(obj):
+    if not isinstance(obj, dict):
+        return None
+    raw = obj.get("endedAt")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed.timestamp()
+
+
+def scan_and_write(state_path, segments_path, now, retention_days):
+    """One deterministic scan-and-write pass. Returns the stdout
+    payload (and performs the write)."""
+    state_path = Path(state_path)
+    segments_path = Path(segments_path)
+    pairs = build_pairs(load_observations(state_path))
+
+    # Candidate records, in fixed window order (session, weekly) and
+    # chronological run order within each window.
+    candidates = []
+    missing_identity = 0
+    zero_observed = 0
+    seen_candidates = set()
+    for window in WINDOWS:
+        for run_pairs, identity in completed_runs(pairs, window):
+            if identity is None:
+                missing_identity += 1
+                continue
+            record = build_record(window, identity, run_pairs)
+            if record is None:
+                zero_observed += 1
+                continue
+            key = record_key(record)
+            if key in seen_candidates:
+                zero_observed += 1
+                continue
+            seen_candidates.add(key)
+            candidates.append((key, record))
+
+    # Existing store: valid, in-retention, first-occurrence lines only.
+    cutoff = float(now) - int(retention_days) * 86400.0
+    kept_lines = []
+    seen_existing = set()
+    pruned = 0
+    for line in load_history_lines(segments_path):
+        try:
+            obj = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pruned += 1
+            continue
+        key = record_key(obj)
+        if key is None:
+            pruned += 1
+            continue
+        stamp = ended_at_stamp(obj)
+        if stamp is None or stamp < cutoff:
+            pruned += 1
+            continue
+        if key in seen_existing:
+            pruned += 1
+            continue
+        seen_existing.add(key)
+        kept_lines.append(line)
+
+    # First-write-wins: existing records always beat re-derived ones.
+    appended = []
+    duplicates = 0
+    for key, record in candidates:
+        if key in seen_existing:
+            duplicates += 1
+            continue
+        seen_existing.add(key)
+        appended.append(record)
+
+    appended_lines = [
+        json.dumps(record, separators=(",", ":"), sort_keys=True)
+        for record in appended]
+    if kept_lines or appended_lines or segments_path.is_file():
+        content = "".join(line + "\n" for line in kept_lines +
+                          appended_lines)
+        observation_mod.atomic_write(segments_path, content)
+        status = "written"
+    else:
+        # Nothing to keep, nothing new, no pre-existing file: nothing
+        # is created. The live view still owns the current segment.
+        status = "skipped"
+
+    return {
+        "appended": len(appended),
+        "appendedSegments": [
+            [record["window"], record["resetsAt"]] for record in appended],
+        "duplicatesSkipped": duplicates,
+        "missingIdentitySkipped": missing_identity,
+        "pruned": pruned,
+        "retentionDays": int(retention_days),
+        "schemaVersion": SCHEMA_VERSION,
+        "segmentsPath": str(segments_path),
+        "status": status,
+        "zeroObservedSkipped": zero_observed,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Persist Agent Fleet completed allowance segments "
+                    "(Phase 4; session and weekly independent, "
+                    "completed-only, first-write-wins, 90-day "
+                    "retention on write).")
+    parser.add_argument("--state", type=Path, default=None,
+                        help="read-only observations store "
+                             "(default: XDG_STATE_HOME/omarchy/"
+                             "agent-fleet/observations.jsonl)")
+    parser.add_argument("--segments", type=Path, default=None,
+                        help="segments.jsonl to maintain "
+                             "(default: next to --state)")
+    pinned = os.environ.get("AGENT_FLEET_NOW", "").strip()
+    parser.add_argument("--now", type=float,
+                        default=float(pinned) if pinned else None,
+                        help="clock for the retention cutoff "
+                             "(default: AGENT_FLEET_NOW, then now)")
+    parser.add_argument("--retention-days", type=int,
+                        default=DEFAULT_RETENTION_DAYS,
+                        help="history retention in days "
+                             "(default: %(default)s)")
+    args = parser.parse_args(argv)
+
+    state = args.state or default_path("observations.jsonl")
+    segments = args.segments or default_path("segments.jsonl")
+    now = args.now if args.now is not None else time.time()
+    try:
+        result = scan_and_write(state, segments, float(now),
+                                int(args.retention_days))
+    except Exception as exc:  # defensive: keep the contract stable
+        note(f"history write failed: {exc}")
+        return 1
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

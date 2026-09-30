@@ -20,13 +20,22 @@ import qs.Ui
 // (scripts/agent-fleet-hermes). Hermes rows are activity counts only; they
 // never feed the bar percentage, the window bars, or any attribution.
 //
-// Phase 3 adds a third, clearly separate section — Weekly Attribution —
+// Phase 3 adds a third, clearly separate section — Attribution —
 // fed by AttributionUsage, a read-only source over the snapshot store that
 // renders the repo's own aggregation chain (agent-fleet-intervals +
-// agent-fleet-aggregate --window weekly). It is inferred only: estimated,
-// unattributed, and coverage never read as provider-billed truth, and the
-// section refreshes once per settled refresh wave without arming or
-// creating a snapshot of its own.
+// agent-fleet-aggregate). It is inferred only: estimated, unattributed,
+// and coverage never read as provider-billed truth, and the section
+// refreshes once per settled refresh wave without arming or creating a
+// snapshot of its own. Phase 4 adds the native [ Weekly ] [ 5-hour ]
+// ButtonGroup selector (AttributionUsage fetches and caches BOTH windows
+// every refresh; the selector only picks the cached summary to render —
+// switching is display-only and never refreshes a collector, takes a
+// snapshot, or writes observations.jsonl or segments.jsonl) and
+// agent / model expand-collapse: each agent row is a clickable ▸/▾
+// header that keeps the agent total visible while its model rows are
+// collapsed, with the expansion state held purely in memory (keyed by
+// stable agent ID, collapsed by default) — toggling changes only the
+// presentation.
 Panel {
   id: root
   moduleName: "io.github.daniluvatar.agent-fleet"
@@ -96,10 +105,53 @@ Panel {
   readonly property bool hermesReady: hermesUsage.dataState === "ready"
   readonly property bool hermesLoading: hermesUsage.dataState === "loading"
 
-  // Phase 3: Weekly Attribution — its own data source (AttributionUsage),
-  // read-only over the snapshot store. The panel never aggregates inline;
-  // the section below just renders what the source exposes.
-  readonly property var attributionUsage: AttributionUsage {}
+  // Phase 3/4: "Attribution" — its own data source (AttributionUsage),
+  // read-only over the snapshot store, now serving BOTH provider windows
+  // (weekly default, session / 5-hour selectable below). The panel never
+  // aggregates inline; the section below only renders what the source
+  // exposes.
+  readonly property var attributionUsage: AttributionUsage { window: root.attributionWindow }
+
+  // [ Weekly ] [ 5-hour ] selector state (Phase 4 session / 5-hour
+  // attribution view). Pure display state: changing it re-renders the
+  // corresponding already-computed cached summary. It never refreshes a
+  // collector, never takes a snapshot, and never writes observations.jsonl
+  // or segments.jsonl. Weekly stays the default.
+  property string attributionWindow: "weekly"
+
+  // Phase 4 (agent / model expand-collapse). In-memory ONLY: the list of
+  // stable agent IDs currently expanded, collapsed by default (empty). The
+  // key is the agent ID from the aggregate — never the display name — so
+  // rows stay addressable deterministically, and the choice is naturally
+  // shared across the weekly / 5-hour selection (expansion is presentation
+  // of whichever window is shown, keyed by the same identity). Toggling is
+  // pure presentation: it issues no commands, refreshes no collector, arms
+  // no snapshot, writes neither observations.jsonl nor segments.jsonl, and
+  // creates no persistent setting. It is reset to collapsed on every shell
+  // (re)load, which is correct — nothing about it needs to survive.
+  property var expandedAgentIds: []
+
+  function isAgentExpanded(agentId) {
+    for (var i = 0; i < root.expandedAgentIds.length; i++)
+      if (root.expandedAgentIds[i] === agentId)
+        return true
+    return false
+  }
+
+  function toggleAgentExpanded(agentId) {
+    var next = []
+    var present = false
+    for (var i = 0; i < root.expandedAgentIds.length; i++) {
+      if (root.expandedAgentIds[i] === agentId) {
+        present = true
+        continue
+      }
+      next.push(root.expandedAgentIds[i])
+    }
+    if (!present)
+      next.push(agentId)
+    root.expandedAgentIds = next
+  }
 
   function formatPercent(p) {
     if (p === null || p === undefined)
@@ -582,19 +634,41 @@ Panel {
 
           PanelSeparator { width: parent.width }
 
-          // Weekly Attribution (Phase 3): inferred attribution only.
-          // All parsing/values live in AttributionUsage; this block only
-          // renders. It is separate from the allowance above and must never
-          // read back as provider-billed truth.
+          // Attribution (Phase 3, extended in Phase 4): inferred
+          // attribution only. All parsing/values live in AttributionUsage;
+          // this block only renders. Separate from the allowance above and
+          // must never read back as provider-billed truth. The native
+          // [ Weekly ] [ 5-hour ] selector picks the cached window to
+          // render — display-only, no commands, no data mutation.
           Column {
             width: parent.width
             spacing: Style.space(4)
 
             PanelSectionHeader {
               width: parent.width
-              text: "Weekly Attribution"
+              text: "Attribution"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            // Native shell-kit selector (qs.Ui ButtonGroup): the same
+            // mutually-exclusive chip row the kit itself uses
+            // (options/value/changed). Selection only drives
+            // root.attributionWindow; AttributionUsage already holds both
+            // windows' computed summaries, so switching issues no commands
+            // and mutates no data.
+            ButtonGroup {
+              width: parent.width
+              options: [
+                { value: "weekly", label: "Weekly" },
+                { value: "session", label: "5-hour" }
+              ]
+              value: root.attributionWindow
+              foreground: root.foreground
+              background: Color.background
+              accent: Color.accent
+              fontFamily: root.fontFamily
+              onChanged: function(v) { root.attributionWindow = v }
             }
 
             Text {
@@ -640,41 +714,90 @@ Panel {
                 font.pixelSize: Style.font.body
               }
 
+              // Phase 4 (agent / model expand-collapse): each agent renders
+              // as one clickable header row — "▸ name … N pp" collapsed,
+              // "▾ name … N pp" expanded — with the model rows visible only
+              // while expanded. Toggling is the ▸/▾ prefix + click on this
+              // row; the state is root.expandedAgentIds (in-memory, keyed by
+              // stable agent ID, collapsed by default). The agent total
+              // stays visible in the header in both states, nothing is ever
+              // hidden, and Unattributed below stays separate — it is never
+              // folded into an agent.
               Repeater {
                 model: root.attributionUsage.agentRows
                 delegate: Column {
                   width: parent.width
                   spacing: Style.space(1)
 
-                  Text {
-                    text: "  " + modelData.name
-                    color: root.foreground
-                    opacity: 0.9
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
+                  // Agent header: always visible, clickable.
+                  // NOTE: no anchors inside this Row — anchored children are
+                  // excluded from Row layout and would collapse the row to
+                  // zero height (the Task 4 first pass did this and the
+                  // rows were invisible in the live panel). Children share
+                  // one caption font size, so top-edge stacking reads as
+                  // vertical centering; the explicit height pins the row so
+                  // the MouseArea below has a stable target.
+                  Row {
+                    id: agentHeaderRow
+                    width: parent.width
+                    height: agentNameText.implicitHeight
+                    spacing: 0
+                    Text {
+                      id: agentNameText
+                      text: (root.isAgentExpanded(modelData.id) ? "\u25be " : "\u25b8 ") + modelData.name
+                      color: root.foreground
+                      opacity: 0.9
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Item {
+                      width: 10
+                      height: 1
+                    }
+                    Text {
+                      width: Math.max(0, agentHeaderRow.width - agentNameText.width - 10)
+                      horizontalAlignment: Text.AlignRight
+                      text: root.attributionUsage.formatPoints(modelData.total) + " pp"
+                      color: root.foreground
+                      opacity: 0.75
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    MouseArea {
+                      width: parent.width
+                      height: parent.height
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleAgentExpanded(modelData.id)
+                    }
                   }
 
-                  Repeater {
-                    model: modelData.models
-                    delegate: Row {
-                      spacing: Style.space(4)
-                      Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "    " + modelData.name
-                        color: root.foreground
-                        opacity: 0.75
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                      Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: root.attributionUsage.formatPoints(modelData.observed) + " pp observed · "
-                             + root.attributionUsage.formatPoints(modelData.estimated) + " pp estimated · "
-                             + root.attributionUsage.formatPoints(modelData.total) + " pp total"
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                  // Model rows: shown only while this agent is expanded.
+                  // observed / estimated / total per model stay distinct.
+                  Column {
+                    visible: root.isAgentExpanded(modelData.id)
+                    width: parent.width
+                    spacing: Style.space(1)
+                    Repeater {
+                      model: modelData.models
+                      delegate: Row {
+                        spacing: Style.space(4)
+                        Text {
+                          text: "    " + modelData.name
+                          color: root.foreground
+                          opacity: 0.75
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          text: root.attributionUsage.formatPoints(modelData.observed) + " pp observed · "
+                               + root.attributionUsage.formatPoints(modelData.estimated) + " pp estimated · "
+                               + root.attributionUsage.formatPoints(modelData.total) + " pp total"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
                       }
                     }
                   }
