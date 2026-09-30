@@ -29,7 +29,9 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 900,
-      "showPercentInBar": true
+      "showPercentInBar": true,
+      "defaultAttributionWindow": "weekly",
+      "showRecentSegments": true
     },
     "schema": [
       {
@@ -48,6 +50,24 @@
         "label": "Show percent used in the bar",
         "defaultValue": true,
         "description": "The bar shows the highest-used window. Turn off for an icon-only bar."
+      },
+      {
+        "key": "defaultAttributionWindow",
+        "type": "enum",
+        "label": "Default attribution window",
+        "options": [
+          "weekly",
+          "session"
+        ],
+        "defaultValue": "weekly",
+        "description": "Which window the [ Weekly ] [ 5-hour ] attribution selector opens on. The selector can always switch; both windows stay cached, and this changes no data."
+      },
+      {
+        "key": "showRecentSegments",
+        "type": "boolean",
+        "label": "Show recent completed segments",
+        "defaultValue": true,
+        "description": "The compact, strictly read-only list of recently completed attribution segments. Hiding it only hides the section — it never affects the local segments store."
       }
     ]
   }

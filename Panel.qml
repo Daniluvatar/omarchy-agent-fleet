@@ -20,13 +20,22 @@ import qs.Ui
 // (scripts/agent-fleet-hermes). Hermes rows are activity counts only; they
 // never feed the bar percentage, the window bars, or any attribution.
 //
-// Phase 3 adds a third, clearly separate section — Weekly Attribution —
+// Phase 3 adds a third, clearly separate section — Attribution —
 // fed by AttributionUsage, a read-only source over the snapshot store that
 // renders the repo's own aggregation chain (agent-fleet-intervals +
-// agent-fleet-aggregate --window weekly). It is inferred only: estimated,
-// unattributed, and coverage never read as provider-billed truth, and the
-// section refreshes once per settled refresh wave without arming or
-// creating a snapshot of its own.
+// agent-fleet-aggregate). It is inferred only: estimated, unattributed,
+// and coverage never read as provider-billed truth, and the section
+// refreshes once per settled refresh wave without arming or creating a
+// snapshot of its own. Phase 4 adds the native [ Weekly ] [ 5-hour ]
+// ButtonGroup selector (AttributionUsage fetches and caches BOTH windows
+// every refresh; the selector only picks the cached summary to render —
+// switching is display-only and never refreshes a collector, takes a
+// snapshot, or writes observations.jsonl or segments.jsonl) and
+// agent / model expand-collapse: each agent row is a clickable ▸/▾
+// header that keeps the agent total visible while its model rows are
+// collapsed, with the expansion state held purely in memory (keyed by
+// stable agent ID, collapsed by default) — toggling changes only the
+// presentation.
 Panel {
   id: root
   moduleName: "io.github.daniluvatar.agent-fleet"
@@ -76,6 +85,18 @@ Panel {
   // the fleet label without a number. The bar's urgent tint (session window
   // at or over 80 %) is the at-a-glance signal and works either way.
   readonly property bool showPercentInBar: setting("showPercentInBar", true) === true
+  // Phase 5 (Task 7): which window's live attribution the panel OPENS on —
+  // "weekly" (existing default) or "session" (5-hour). Presentation-only:
+  // it only seeds the [ Weekly ] [ 5-hour ] selector's initial selection;
+  // AttributionUsage still fetches and caches BOTH windows every settle,
+  // switching is display-only, and the value changes no data or math.
+  readonly property string defaultAttributionWindow:
+    setting("defaultAttributionWindow", "weekly") === "session" ? "session" : "weekly"
+  // Phase 5 (Task 7): whether the Recent Segments section (Task 6) shows.
+  // Presentation-only: hiding it renders nothing and stops further
+  // HistoryUsage refreshes (enabled=false); the section is strictly
+  // read-only either way — the segments store is never written by it.
+  readonly property bool showRecentSegments: setting("showRecentSegments", true) === true
 
   // ------------------------------------------------------------- data
   readonly property var codexUsage: CodexUsage {}
@@ -96,10 +117,69 @@ Panel {
   readonly property bool hermesReady: hermesUsage.dataState === "ready"
   readonly property bool hermesLoading: hermesUsage.dataState === "loading"
 
-  // Phase 3: Weekly Attribution — its own data source (AttributionUsage),
-  // read-only over the snapshot store. The panel never aggregates inline;
-  // the section below just renders what the source exposes.
-  readonly property var attributionUsage: AttributionUsage {}
+  // Phase 3/4: "Attribution" — its own data source (AttributionUsage),
+  // read-only over the snapshot store, now serving BOTH provider windows
+  // (weekly default, session / 5-hour selectable below). The panel never
+  // aggregates inline; the section below only renders what the source
+  // exposes.
+  readonly property var attributionUsage: AttributionUsage { window: root.attributionWindow }
+
+  // Phase 5 (Task 6): "Recent Segments" — its own strictly read-only
+  // data source (HistoryUsage) over segments.jsonl: the CLI's --list
+  // mode renders the already-persisted completed segments (both windows
+  // coexist, newest first), so this source can never append, prune,
+  // rewrite the store, or even read observations.jsonl. It is NOT
+  // filtered by the window selector — the selector only chooses the
+  // live attribution summary above.
+  readonly property var historyUsage: HistoryUsage {}
+  // [ Weekly ] [ 5-hour ] selector state (Phase 4 session / 5-hour
+  // attribution view). Pure display state: changing it re-renders the
+  // corresponding already-computed cached summary. It never refreshes a
+  // collector, never takes a snapshot, and never writes observations.jsonl
+  // or segments.jsonl. The initial value comes from the Task 7 manifest
+  // setting defaultAttributionWindow (weekly by default, so existing
+  // behavior is unchanged); the first selector click breaks the binding
+  // and the choice remains per-shell session state, exactly as before.
+  property string attributionWindow: root.defaultAttributionWindow
+
+  // Phase 5 (Task 7): apply the showRecentSegments manifest setting to the
+  // HistoryUsage data source (default: true = active). Done at completion:
+  // when off, the source stays inert for all later refresh waves.
+  Component.onCompleted: root.historyUsage.enabled = root.showRecentSegments
+
+  // Phase 4 (agent / model expand-collapse). In-memory ONLY: the list of
+  // stable agent IDs currently expanded, collapsed by default (empty). The
+  // key is the agent ID from the aggregate — never the display name — so
+  // rows stay addressable deterministically, and the choice is naturally
+  // shared across the weekly / 5-hour selection (expansion is presentation
+  // of whichever window is shown, keyed by the same identity). Toggling is
+  // pure presentation: it issues no commands, refreshes no collector, arms
+  // no snapshot, writes neither observations.jsonl nor segments.jsonl, and
+  // creates no persistent setting. It is reset to collapsed on every shell
+  // (re)load, which is correct — nothing about it needs to survive.
+  property var expandedAgentIds: []
+
+  function isAgentExpanded(agentId) {
+    for (var i = 0; i < root.expandedAgentIds.length; i++)
+      if (root.expandedAgentIds[i] === agentId)
+        return true
+    return false
+  }
+
+  function toggleAgentExpanded(agentId) {
+    var next = []
+    var present = false
+    for (var i = 0; i < root.expandedAgentIds.length; i++) {
+      if (root.expandedAgentIds[i] === agentId) {
+        present = true
+        continue
+      }
+      next.push(root.expandedAgentIds[i])
+    }
+    if (!present)
+      next.push(agentId)
+    root.expandedAgentIds = next
+  }
 
   function formatPercent(p) {
     if (p === null || p === undefined)
@@ -220,6 +300,11 @@ Panel {
     // snapshot or refresh a collector, so no recursion, no extra capture.
     if (root.attributionUsage && root.attributionUsage.refresh)
       root.attributionUsage.refresh()
+    // Recent Segments re-renders whatever the store holds now (a segment
+    // may have been just persisted for a completed window). Read-only:
+    // the list path never writes, prunes, or touches observations.jsonl.
+    if (root.historyUsage && root.historyUsage.refresh)
+      root.historyUsage.refresh()
   }
 
   Process {
@@ -582,25 +667,60 @@ Panel {
 
           PanelSeparator { width: parent.width }
 
-          // Weekly Attribution (Phase 3): inferred attribution only.
-          // All parsing/values live in AttributionUsage; this block only
-          // renders. It is separate from the allowance above and must never
-          // read back as provider-billed truth.
+          // Attribution (Phase 3, extended in Phase 4): inferred
+          // attribution only. All parsing/values live in AttributionUsage;
+          // this block only renders. Separate from the allowance above and
+          // must never read back as provider-billed truth. The native
+          // [ Weekly ] [ 5-hour ] selector picks the cached window to
+          // render — display-only, no commands, no data mutation.
           Column {
             width: parent.width
             spacing: Style.space(4)
 
             PanelSectionHeader {
               width: parent.width
-              text: "Weekly Attribution"
+              text: "Attribution"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            // Native shell-kit selector (qs.Ui ButtonGroup): the same
+            // mutually-exclusive chip row the kit itself uses
+            // (options/value/changed). Selection only drives
+            // root.attributionWindow; AttributionUsage already holds both
+            // windows' computed summaries, so switching issues no commands
+            // and mutates no data.
+            ButtonGroup {
+              width: parent.width
+              options: [
+                { value: "weekly", label: "Weekly" },
+                { value: "session", label: "5-hour" }
+              ]
+              value: root.attributionWindow
+              foreground: root.foreground
+              background: Color.background
+              accent: Color.accent
+              fontFamily: root.fontFamily
+              onChanged: function(v) { root.attributionWindow = v }
             }
 
             Text {
               width: parent.width
               text: root.attributionUsage.explanationLine
               color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            // Phase 5 (Task 7): expand/collapse discoverability — one
+            // faint hint line, shown only while there is an agent to
+            // expand. No behavior or state change beyond rendering.
+            Text {
+              visible: root.attributionUsage.hasAgentRows
+              width: parent.width
+              text: "Click an agent to expand or collapse its models"
+              color: root.faint
+              opacity: 0.8
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
@@ -625,6 +745,27 @@ Panel {
               width: parent.width
               spacing: Style.space(4)
 
+              // Phase 4.5 (gap and reset markers): compact rows for the
+              // evidence discontinuities of THIS window. Marker type and
+              // time come verbatim from the aggregate CLI via
+              // AttributionUsage.markers (pure pass-through) — the
+              // delegate only renders glyphs and the real clock time;
+              // no parsing, no invented timestamps, durations, or
+              // confidence. Markers never alter the numbers below.
+              Repeater {
+                model: root.attributionUsage.markers
+                delegate: Text {
+                  width: parent.width
+                  text: (modelData.type === "reset_boundary"
+                         ? "↻ Reset boundary"
+                         : "○ Evidence gap")
+                       + (modelData.at ? " · " + String(modelData.at).slice(11, 16) : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
               Text {
                 text: root.attributionUsage.observedText
                 color: root.foreground
@@ -640,41 +781,90 @@ Panel {
                 font.pixelSize: Style.font.body
               }
 
+              // Phase 4 (agent / model expand-collapse): each agent renders
+              // as one clickable header row — "▸ name … N pp" collapsed,
+              // "▾ name … N pp" expanded — with the model rows visible only
+              // while expanded. Toggling is the ▸/▾ prefix + click on this
+              // row; the state is root.expandedAgentIds (in-memory, keyed by
+              // stable agent ID, collapsed by default). The agent total
+              // stays visible in the header in both states, nothing is ever
+              // hidden, and Unattributed below stays separate — it is never
+              // folded into an agent.
               Repeater {
                 model: root.attributionUsage.agentRows
                 delegate: Column {
                   width: parent.width
                   spacing: Style.space(1)
 
-                  Text {
-                    text: "  " + modelData.name
-                    color: root.foreground
-                    opacity: 0.9
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
+                  // Agent header: always visible, clickable.
+                  // NOTE: no anchors inside this Row — anchored children are
+                  // excluded from Row layout and would collapse the row to
+                  // zero height (the Task 4 first pass did this and the
+                  // rows were invisible in the live panel). Children share
+                  // one caption font size, so top-edge stacking reads as
+                  // vertical centering; the explicit height pins the row so
+                  // the MouseArea below has a stable target.
+                  Row {
+                    id: agentHeaderRow
+                    width: parent.width
+                    height: agentNameText.implicitHeight
+                    spacing: 0
+                    Text {
+                      id: agentNameText
+                      text: (root.isAgentExpanded(modelData.id) ? "\u25be " : "\u25b8 ") + modelData.name
+                      color: root.foreground
+                      opacity: 0.9
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Item {
+                      width: 10
+                      height: 1
+                    }
+                    Text {
+                      width: Math.max(0, agentHeaderRow.width - agentNameText.width - 10)
+                      horizontalAlignment: Text.AlignRight
+                      text: root.attributionUsage.formatPoints(modelData.total) + " pp"
+                      color: root.foreground
+                      opacity: 0.75
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    MouseArea {
+                      width: parent.width
+                      height: parent.height
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleAgentExpanded(modelData.id)
+                    }
                   }
 
-                  Repeater {
-                    model: modelData.models
-                    delegate: Row {
-                      spacing: Style.space(4)
-                      Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "    " + modelData.name
-                        color: root.foreground
-                        opacity: 0.75
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                      Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: root.attributionUsage.formatPoints(modelData.observed) + " pp observed · "
-                             + root.attributionUsage.formatPoints(modelData.estimated) + " pp estimated · "
-                             + root.attributionUsage.formatPoints(modelData.total) + " pp total"
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                  // Model rows: shown only while this agent is expanded.
+                  // observed / estimated / total per model stay distinct.
+                  Column {
+                    visible: root.isAgentExpanded(modelData.id)
+                    width: parent.width
+                    spacing: Style.space(1)
+                    Repeater {
+                      model: modelData.models
+                      delegate: Row {
+                        spacing: Style.space(4)
+                        Text {
+                          text: "    " + modelData.name
+                          color: root.foreground
+                          opacity: 0.75
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                        Text {
+                          text: root.attributionUsage.formatPoints(modelData.observed) + " pp observed · "
+                               + root.attributionUsage.formatPoints(modelData.estimated) + " pp estimated · "
+                               + root.attributionUsage.formatPoints(modelData.total) + " pp total"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
                       }
                     }
                   }
@@ -699,6 +889,81 @@ Panel {
                 opacity: 0.8
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          PanelSeparator { width: parent.width; visible: root.showRecentSegments }
+
+          // Recent Segments (Phase 5, Task 6; Task 7 adds the
+          // showRecentSegments manifest setting to hide it): the completed
+          // attribution segments already in segments.jsonl — both windows
+          // coexisting, newest first, max 5 compact rows. Render-only: every
+          // value (window label, persisted range, observed, coverage,
+          // unattributed) comes from HistoryUsage, which reads the store
+          // through the CLI's strict read-only --list mode. Opening,
+          // closing, or scrolling this section issues no other commands,
+          // never creates a snapshot, and never touches observations.jsonl
+          // or the store's bytes. The [ Weekly ] [ 5-hour ] selector above
+          // does NOT filter this list. Empty store is a normal state, not
+          // an error. Hidden when showRecentSegments is false (with the
+          // separator above).
+          Column {
+            visible: root.showRecentSegments
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "Recent Segments"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: root.historyUsage.empty
+              width: parent.width
+              text: root.historyUsage.emptyText
+              color: root.dim
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              visible: !root.historyUsage.empty
+              width: parent.width
+              spacing: Style.space(6)
+              Repeater {
+                model: root.historyUsage.rows
+                delegate: Column {
+                  width: parent.width
+                  spacing: Style.space(1)
+                  Row {
+                    spacing: Style.space(6)
+                    Text {
+                      text: modelData.windowLabel
+                      color: root.foreground
+                      opacity: 0.9
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      text: modelData.range
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  Text {
+                    width: parent.width
+                    text: "    " + modelData.line
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
               }
             }
           }

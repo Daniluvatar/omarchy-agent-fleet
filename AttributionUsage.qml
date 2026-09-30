@@ -2,27 +2,37 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// AttributionUsage — the "Weekly Attribution" data source for the panel.
+// AttributionUsage — the "Attribution" section data source for the panel.
 //
 // It is a separate, read-only data source (the same shape as CodexUsage and
 // HermesUsage) so that parsing and layout math never live in Panel.qml. It
-// runs the repo's own aggregation chain exactly as the CLI does — two bare
-// local commands, no shell, no network:
+// runs the repo's own aggregation chain exactly as the CLI does — bare local
+// commands, no shell, no network:
 //
 //   scripts/agent-fleet-intervals --state <observations.jsonl>
-//   scripts/agent-fleet-aggregate --window weekly --state <observations.jsonl>
+//   scripts/agent-fleet-aggregate --window weekly  --state <observations.jsonl>
+//   scripts/agent-fleet-aggregate --window session --state <observations.jsonl>
 //
-// Neither command writes anything: the snapshot store appends, and this
-// component only reads it back. Refreshing this section therefore can never
-// create a snapshot, never arms a wave, and never touches the collectors —
-// the panel pulls it once, after a wave has settled (see Panel.qml).
+// Neither aggregate command writes anything: the snapshot store appends, and
+// this component only reads it back. Refreshing this section therefore can
+// never create a snapshot, never arms a refresh wave, and never touches the
+// collectors — the panel pulls it once, after a wave has settled (see
+// Panel.qml).
 //
-// States:
+// Phase 4 (session / 5-hour attribution view): BOTH provider windows are
+// fetched and cached on every refresh, independently (never mixed — each
+// window's state is derived from its own intervals and its own summary). The
+// panel's [ Weekly ] [ 5-hour ] selector only picks which cached summary to
+// render: switching windows is display-only and issues no new commands, so
+// it can never refresh a collector, create a snapshot, write
+// observations.jsonl, or touch segments.jsonl.
+//
+// Per-window states:
 //   "collecting"  no observations yet (no store, or the builder produced no
 //                 intervals)
-//   "new_window"  a weekly reset happened but no usable post-reset interval
-//                 exists yet
-//   "ready"       the current weekly segment produced a summary
+//   "new_window"  a reset happened in this window but no usable post-reset
+//                 interval exists yet
+//   "ready"       this window's current segment produced a summary
 //
 // Copy rules (required terminology): Observed, Estimated, Unattributed,
 // Coverage, pp. Never provider-truth words ("exact", "cost", "charged",
@@ -33,8 +43,13 @@ Item {
   id: attribution
   visible: false
 
-  property int version: 1
-  property string schema: "attribution-usage/v1"
+  property int version: 2
+  property string schema: "attribution-usage/v2"
+
+  // The selected window: "weekly" (default) or "session". Driven by the
+  // panel selector; changing it re-renders cached data only — it never
+  // starts a process, arms a wave, or writes a store.
+  property string window: "weekly"
 
   // The one place in the UI where the store path is resolved: the same
   // default the snapshot writer and the aggregation CLIs use
@@ -54,27 +69,50 @@ Item {
     Qt.resolvedUrl("scripts/agent-fleet-intervals").toString().replace(/^file:\/\//, ""),
     "--state", attribution.statePath
   ]
-  readonly property var aggregateCommand: [
+  readonly property var weeklyCommand: [
     Qt.resolvedUrl("scripts/agent-fleet-aggregate").toString().replace(/^file:\/\//, ""),
     "--window", "weekly", "--state", attribution.statePath
   ]
+  readonly property var sessionCommand: [
+    Qt.resolvedUrl("scripts/agent-fleet-aggregate").toString().replace(/^file:\/\//, ""),
+    "--window", "session", "--state", attribution.statePath
+  ]
 
-  // "collecting" | "new_window" | "ready"
-  property string dataState: "collecting"
-  property bool refreshing: false
-  property bool hasGap: false
+  // Per-refresh per-window cache:
+  //   { weekly: { state, hasGap, summary }, session: { state, hasGap, summary } }
+  // state ∈ "collecting" | "new_window" | "ready"; summary is the
+  // agent-fleet-aggregate payload for that window, or null.
+  property var windowData: null
 
-  // The weekly aggregation summary (agent-fleet-aggregate payload) or null.
-  property var summary: null
+  readonly property var entry: {
+    var data = attribution.windowData
+    if (data && attribution.window === "session" && data.session)
+      return data.session
+    if (data && attribution.window === "weekly" && data.weekly)
+      return data.weekly
+    return { state: "collecting", hasGap: false, summary: null }
+  }
 
-  // The interval rows (agent-fleet-intervals payload) or null — used only
-  // to place the current segment's weekly-reset boundary.
-  property var intervalRows: []
-
+  readonly property string dataState: entry.state
   readonly property bool ready: attribution.dataState === "ready"
-  readonly property bool hasSummary: attribution.hasSummary_()
+  readonly property var summary: entry.summary
+  readonly property bool hasSummary: attribution.summary !== null
 
-  function hasSummary_() { return attribution.summary !== null }
+  // Phase 4.5 (gap and reset markers): display metadata for the window
+  // being rendered, computed by the aggregate CLI — e.g.
+  //   [ { "type": "reset_boundary", "at": "2026-09-26T12:00:00-05:00" },
+  //     { "type": "gap",            "at": "2026-09-26T13:05:00-05:00" } ]
+  // Strict pass-through: marker types and timestamps come straight from
+  // the CLI output; nothing here is parsed, reinterpreted, or invented
+  // (no durations, no confidence, no fabricated timestamps). The panel
+  // only renders; when the window has no summary (collecting / new_window)
+  // there are no markers.
+  readonly property var markers: {
+    var s = attribution.summary
+    if (s && s.markers && s.markers.length)
+      return s.markers
+    return []
+  }
 
   // ------------------------------------------------------ display helpers
   // "11" for 11.0, "1.5" for 1.5 — at most two decimals, no fabricated
@@ -105,7 +143,11 @@ Item {
 
   // Agents in display order (the aggregate is already deterministic by
   // name); zero-attribution agents are dropped so nothing is presented as
-  // evidence it is not.
+  // evidence it is not. Phase 4 (expand/collapse) adds two render-only
+  // fields: `id`, the stable agent identity from the aggregate (used as the
+  // in-memory expansion-state key — never the display name), and `total`,
+  // the agent's own totalAttributedPoints so the panel can keep the agent
+  // total visible while its model rows are collapsed.
   readonly property var agentRows: {
     var out = []
     if (!attribution.summary || !attribution.summary.agents)
@@ -124,7 +166,12 @@ Item {
           total: (Number(m.observedSinglePoints) || 0) + (Number(m.estimatedSharedPoints) || 0)
         })
       }
-      out.push({ name: String(a.agent || ""), models: models })
+      out.push({
+        id: String(a.agent || ""),
+        name: String(a.agent || ""),
+        total: (Number(a.totalAttributedPoints) || 0),
+        models: models
+      })
     }
     return out
   }
@@ -149,8 +196,6 @@ Item {
            : "Unattributed: " + formatPoints(total) + " pp")
   }
 
-  // "Unattributed: N pp" alone (breakdown stays in the faint meta line so
-  // the rows stay scannable).
   readonly property bool hasAgentRows: {
     for (var i = 0; i < agentRows.length; i++)
       if (agentRows[i].models.length > 0)
@@ -161,9 +206,12 @@ Item {
   readonly property string statusText: {
     if (attribution.dataState === "collecting")
       return "Collecting attribution data…"
-    if (attribution.dataState === "new_window")
+    if (attribution.dataState === "new_window") {
+      if (attribution.window === "session")
+        return "New 5-hour window — collecting data…"
       return "New weekly window — collecting data…"
-    if (attribution.dataState === "ready" && attribution.hasGap)
+    }
+    if (attribution.dataState === "ready" && entry.hasGap)
       return "Attribution incomplete — Codex observations contain gaps."
     return ""
   }
@@ -175,13 +223,15 @@ Item {
       "Coverage is the share of observed movement Agent Fleet could attribute to an agent and model — not a share of the subscription."
 
   // ------------------------------------------------------------- refresh
-  // Read-only recompute. It never arms a snapshot, never calls the
-  // collectors, and is never called from its own handlers, so it cannot
-  // recurse or write observations.
+  // Read-only recompute for BOTH windows. It never arms a snapshot, never
+  // calls the collectors, and is never called from the window selector, so
+  // none of it can recurse, refresh a collector, or write observations.
   signal settled()
 
+  property bool refreshing: false
   property bool intervalsDone: false
-  property bool aggregateDone: false
+  property bool weeklyDone: false
+  property bool sessionDone: false
 
   function refresh() {
     if (attribution.refreshing)
@@ -190,42 +240,85 @@ Item {
     // item — the same pattern the working Codex/Hermes collectors use. The
     // guard keeps a first-paint call (Component.onCompleted ordering) from
     // wedging "refreshing" true before the Process children exist.
-    if (!intervalsProcess || !aggregateProcess)
+    if (!intervalsProcess || !aggregateWeeklyProcess || !aggregateSessionProcess)
       return
     attribution.refreshing = true
     attribution.intervalsDone = false
-    attribution.aggregateDone = false
+    attribution.weeklyDone = false
+    attribution.sessionDone = false
     if (!intervalsProcess.running) {
       intervalsProcess.command = attribution.intervalsCommand
       intervalsProcess.running = true
     }
-    if (!aggregateProcess.running) {
-      aggregateProcess.command = attribution.aggregateCommand
-      aggregateProcess.running = true
+    if (!aggregateWeeklyProcess.running) {
+      aggregateWeeklyProcess.command = attribution.weeklyCommand
+      aggregateWeeklyProcess.running = true
+    }
+    if (!aggregateSessionProcess.running) {
+      aggregateSessionProcess.command = attribution.sessionCommand
+      aggregateSessionProcess.running = true
     }
   }
 
-  // Both commands are fast and independent; the second to finish finalizes.
+  // The three commands are fast and independent; the last to finish
+  // finalizes exactly once. Per-process flags (not a counter) because both
+  // the stream-finished and the exited signals arrive per process — the
+  // flags make the double arrival a no-op, and `refreshing` gates a second
+  // finalize (same pattern as the v1 two-process version).
   function _markDone(which) {
     if (which === "intervals")
       attribution.intervalsDone = true
+    else if (which === "weekly")
+      attribution.weeklyDone = true
     else
-      attribution.aggregateDone = true
-    if (attribution.intervalsDone && attribution.aggregateDone
+      attribution.sessionDone = true
+    if (attribution.intervalsDone && attribution.weeklyDone && attribution.sessionDone
             && attribution.refreshing) // exactly one finalize per refresh
       attribution._finish()
   }
 
-  function _finish() {
-    // Parse the aggregate summary. Absent/unparseable ⇒ not ready.
-    var summary = null
+  function _parseSummary(stream) {
     try {
-      var body = String(aggregateStream.text || "").trim()
+      var body = String(stream.text || "").trim()
       if (body !== "")
-        summary = JSON.parse(body)
+        return JSON.parse(body)
     } catch (err) {
-      summary = null
+      return null
     }
+    return null
+  }
+
+  // Per-window state — deliberately computed from that window's own
+  // segment and its own interval rows so weekly and session never mix.
+  function _windowState(win, summary, rows) {
+    var segStart = (summary && summary.segmentStartAt !== null && summary.segmentStartAt !== undefined)
+        ? String(summary.segmentStartAt) : ""
+    if (segStart !== "") {
+      // Current segment for this window exists: render it, flagging
+      // Codex gaps in that same window.
+      var lastReset = -1
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i].codex ? rows[i].codex[win] : null
+        if (row && row.status === "reset_boundary")
+          lastReset = i
+      }
+      var hasGap = false
+      for (var j = lastReset + 1; j < rows.length; j++) {
+        var w = rows[j].codex ? rows[j].codex[win] : null
+        if (w && w.status === "gap") {
+          hasGap = true
+          break
+        }
+      }
+      return { state: "ready", hasGap: hasGap, summary: summary }
+    }
+    if (rows.length > 0)
+      // Observations exist but nothing after the latest reset in this window.
+      return { state: "new_window", hasGap: false, summary: null }
+    return { state: "collecting", hasGap: false, summary: null }
+  }
+
+  function _finish() {
     var rows = []
     try {
       var rowsText = String(intervalsStream.text || "").trim()
@@ -237,35 +330,10 @@ Item {
     } catch (err) {
       rows = []
     }
-    attribution.summary = summary
-    attribution.intervalRows = rows
-    attribution.hasGap = false
-
-    var segStart = (summary && summary.segmentStartAt !== null && summary.segmentStartAt !== undefined)
-        ? String(summary.segmentStartAt) : ""
-    if (segStart !== "") {
-      // Current weekly segment exists: render it, flagging weekly Codex gaps.
-      var lastReset = -1
-      for (var i = 0; i < rows.length; i++) {
-        var row = rows[i].codex ? rows[i].codex.weekly : null
-        if (row && row.status === "reset_boundary")
-          lastReset = i
-      }
-      for (var j = lastReset + 1; j < rows.length; j++) {
-        var w = rows[j].codex ? rows[j].codex.weekly : null
-        if (w && w.status === "gap") {
-          attribution.hasGap = true
-          break
-        }
-      }
-      attribution.dataState = "ready"
-    } else if (rows.length > 0) {
-      // Observations exist but nothing after the latest weekly reset.
-      attribution.dataState = "new_window"
-    } else {
-      attribution.dataState = "collecting"
+    attribution.windowData = {
+      weekly: _windowState("weekly", _parseSummary(weeklyStream), rows),
+      session: _windowState("session", _parseSummary(sessionStream), rows)
     }
-
     attribution.refreshing = false
     attribution.settled()
   }
@@ -281,23 +349,38 @@ Item {
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(code, signal) {
-      // Safety net: a crash or missing binary settles to "collecting".
+      // Safety net: a crash or missing binary still settles the refresh.
       attribution._markDone("intervals")
     }
   }
 
   Process {
-    id: aggregateProcess
+    id: aggregateWeeklyProcess
     running: false
     command: []
     stdout: StdioCollector {
-      id: aggregateStream
+      id: weeklyStream
       waitForEnd: true
-      onStreamFinished: function() { attribution._markDone("aggregate") }
+      onStreamFinished: function() { attribution._markDone("weekly") }
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(code, signal) {
-      attribution._markDone("aggregate")
+      attribution._markDone("weekly")
+    }
+  }
+
+  Process {
+    id: aggregateSessionProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: sessionStream
+      waitForEnd: true
+      onStreamFinished: function() { attribution._markDone("session") }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code, signal) {
+      attribution._markDone("session")
     }
   }
 

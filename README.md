@@ -342,14 +342,18 @@ omarchy-agent-fleet/
 ├── CodexUsage.qml            Phase 1 data source: allowance record from agent-fleet-codex
 ├── HermesUsage.qml           Phase 2 data source: activity record from agent-fleet-hermes
 ├── AttributionUsage.qml      Phase 3 data source: runs the intervals→attribution→
-│                             aggregate chain read-only for the Weekly Attribution section
+│                             aggregate chain read-only for the Attribution section
+├── HistoryUsage.qml          Phase 5 data source: strictly read-only `--list` source
+│                             for the Recent Segments section (never writes the store)
 ├── scripts/
 │   ├── agent-fleet-codex     Codex allowance collector (Python 3, stdlib only)
 │   ├── agent-fleet-hermes    Hermes activity collector (Python 3, stdlib + sqlite3)
 │   ├── agent-fleet-snapshot  Phase 3 store writer: one settled observation per refresh wave
 │   ├── agent-fleet-intervals Phase 3: observations → interval records (pure)
 │   ├── agent-fleet-attribution Phase 3: intervals → attribution records (pure)
-│   └── agent-fleet-aggregate Phase 3: per-window rollup (pure)
+│   ├── agent-fleet-aggregate Phase 3: per-window rollup (pure)
+│   └── agent-fleet-history   Phase 4 segments store: append on completion, 90-day
+│                             retention (write path), and `--list` (strictly read-only)
 ├── tests/
 │   ├── test_agent_fleet_codex.py
 │   ├── test_agent_fleet_hermes.py
@@ -358,6 +362,8 @@ omarchy-agent-fleet/
 │   ├── test_agent_fleet_attribution.py    Phase 3 categories + invariants
 │   ├── test_agent_fleet_aggregate.py      Phase 3 rollups, pp, coverage
 │   ├── test_agent_fleet_failure_recovery.py Phase 3 fail-safe behavior
+│   ├── test_agent_fleet_history.py        Phase 4/5 store write contract + read-only `--list`
+│   ├── test_agent_fleet_markers.py        Phase 4.5 gap/reset marker display metadata
 │   ├── make_hermes_fixtures.py        regenerates the synthetic Hermes DBs
 │   └── fixtures/
 │       ├── codex-normal.json / codex-unavailable.json / codex-malformed.json
@@ -423,8 +429,10 @@ the deliberate `omarchy plugin enable` step.
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-151 tests — 27 Codex, 37 Hermes, 26 snapshot, 24 intervals, 17 attribution,
-19 aggregate, 1 failure-recovery — all offline, stdlib only; nothing reads
+192 tests — 27 Codex, 37 Hermes, 26 snapshot, 24 intervals, 17 attribution,
+19 aggregate, 1 failure-recovery, 27 history (Phase 4 store + the Phase 5
+`--list` read-only contract), 14 markers (Phase 4.5 gap/reset display
+metadata) — all offline, stdlib only; nothing reads
 the live `~/.hermes` tree, the Codex integration, or the network. Hermes
 tests run
 against a synthetic profile tree in `tests/fixtures/hermes-profiles/`
@@ -696,16 +704,60 @@ See `docs/phase-3-attribution-notes.md` for the verification notes
 (source-of-truth decisions, verified command shapes, fixture inventory)
 that this section summarizes.
 
+## Recent Segments — completed attribution windows (Phase 4/5)
+
+`Panel.qml` also renders a **read-only “Recent Segments” list**: the
+**5 most recent completed** attribution segments already persisted in
+`segments.jsonl`, **newest first**, with **both windows coexisting**
+(`Weekly` and `5-hour`).
+
+- Each row shows the window label, the **persisted time range**
+  (e.g. `2026-09-22 → 2026-09-29`, or `08:30 → 13:30`), `observedPoints`,
+  `coveragePercent`, and — compact, when non-zero — `unattributedPoints`.
+  There is no unbounded expansion, and no raw observations, prompts, IDs,
+  or logs (the record schema itself excludes them).
+- **Strictly read-only.** The panel data source (`HistoryUsage.qml`) calls
+  only `scripts/agent-fleet-history --list`: one JSON document, newest
+  first, sorted from the persisted records. That mode **never scans**
+  `observations.jsonl`, **never prunes**, **never re-derives**, and
+  **never writes** to the segments store. Opening, closing, or refreshing
+  the section does not mutate the store; a missing store is a normal
+  empty state (“No completed segments yet”), not an error.
+- **No read-time retention filter.** The 90-day retention policy still
+  applies at write time only, when a completed segment is first persisted
+  (Task 2 semantics). Listing never applies retention and never repairs
+  or deletes records.
+- **No selector coupling.** The `[ Weekly ] [ 5-hour ]` selector chooses
+  the *live* attribution summary above; it does not filter the persisted
+  segment list — both windows always coexist there.
+- The Phase 4.5 gap/reset **markers** (display metadata derived in
+  `scripts/agent-fleet-aggregate`, never stored) and the expand/collapse
+  of the *live* attribution summary are implemented in the same panel;
+  `Coverage: N%` keeps its definition line.
+- **Settings (Task 7):** two manifest settings, both presentation-only —
+  `defaultAttributionWindow` (`weekly` (default) | `session`) seeds the
+  `[ Weekly ] [ 5-hour ]` selector's initial selection; the selector
+  itself, expand/collapse, and both cached windows work exactly as
+  before. `showRecentSegments` (`true` default | `false`) hides this
+  section and its separator (and stops the read-only `--list` process
+  running); turning it off never affects the store. Neither setting
+  changes attribution math, retention, snapshots, or the history store.
+  A configurable row count was deliberately *not* exposed — `5`
+  stays a component constant (`HistoryUsage.maxRows`) to keep the
+  manifest small; it can gain a setting later without a behavior change.
+
+`tests/test_agent_fleet_history.py` covers the `--list` contract
+(ordering, weekly + session coexistence, persisted fidelity,
+malformed-line tolerance, byte-for-byte read-only behavior,
+single-JSON-document stdout); `tests/test_agent_fleet_markers.py`
+covers the marker display metadata.
+
 ## Future direction (roadmap, not implemented)
 
-- **Phase 4 — attribution UX polish:** per-agent expand/collapse, visible
-  reset/segment boundary markers, a session-window view in the panel (the
-  engine already supports it), and a compact per-segment history
-  (coverage and pp per completed segment) in the store-backed form.
 - Hermes activity for additional providers (Claude, Grok, Copilot, local)
   and other harnesses (e.g. OpenClaw, Pi).
-- Historical allowance snapshots and a local history store; burn-rate
-  analytics, forecasting, charts, export/reporting.
+- Historical allowance snapshots and burn-rate analytics, forecasting,
+  charts, export/reporting on top of the existing completed-segment store.
 - Cross-machine sync.
 
 ## References
